@@ -67,9 +67,19 @@ struct qoi_header_t {
 	char     magic[4];   // magic bytes "qoif"
 	uint32_t width;      // image width in pixels (BE)
 	uint32_t height;     // image height in pixels (BE)
-	uint8_t  channels;   // 3 = RGB, 4 = RGBA
+	uint8_t  channels;   // 1 = gray, 3 = RGB, 4 = RGBA
 	uint8_t  colorspace; // 0 = sRGB with linear alpha, 1 = all channels linear
 };
+
+Single channel (gray) images are stored with channels = 1 in the header. In
+gray files the QOI_OP_RGBA tag (0xff) is repurposed as QOI_OP_GRAY, followed
+by a single gray byte, so each gray value is stored as just one channel. All
+other chunks work as usual with r = g = b and a = 255. When decoding a gray
+file, the caller chooses the output format through the channels argument:
+1 keeps the single gray channel, 3 or 4 expand each gray value to RGB or
+RGBA. A gray file whose pixel stream decodes to non-gray values
+(r != g != b or a != 255) is invalid and rejected by qoi_decode. Requesting
+single channel output from a 3 or 4 channel file is rejected as well.
 
 Images are encoded row by row, left to right, top to bottom. The decoder and
 encoder start with {r: 0, g: 0, b: 0, a: 255} as the previous pixel value. An
@@ -205,6 +215,19 @@ The alpha value remains unchanged from the previous pixel.
 8-bit  blue channel value
 8-bit alpha channel value
 
+
+.- QOI_OP_GRAY (only in files with channels = 1) ---.
+|         Byte[0]         |         Byte[1]         |
+|  7  6  5  4  3  2  1  0 | 7  6  5  4  3  2  1  0 |
+|-------------------------+-------------------------|
+|  1  1  1  1  1  1  1  1 |         gray            |
+`---------------------------------------------------`
+8-bit tag b11111111
+8-bit gray channel value
+
+Only valid in single channel (gray) files, where it takes the place of
+QOI_OP_RGBA. The decoded pixel is {r: gray, g: gray, b: gray, a: 255}.
+
 */
 
 
@@ -242,9 +265,9 @@ typedef struct {
 
 #ifndef QOI_NO_STDIO
 
-/* Encode raw RGB or RGBA pixels into a QOI image and write it to the file
-system. The qoi_desc struct must be filled with the image width, height,
-number of channels (3 = RGB, 4 = RGBA) and the colorspace.
+/* Encode raw gray, RGB or RGBA pixels into a QOI image and write it to the
+file system. The qoi_desc struct must be filled with the image width, height,
+number of channels (1 = gray, 3 = RGB, 4 = RGBA) and the colorspace.
 
 The function returns 0 on failure (invalid parameters, or fopen or malloc
 failed) or the number of bytes written on success. */
@@ -253,8 +276,9 @@ int qoi_write(const char *filename, const void *data, const qoi_desc *desc);
 
 
 /* Read and decode a QOI image from the file system. If channels is 0, the
-number of channels from the file header is used. If channels is 3 or 4 the
-output format will be forced into this number of channels.
+number of channels from the file header is used. If channels is 1, 3 or 4 the
+output format will be forced into this number of channels. Single channel
+output (channels = 1) is only valid for files that are stored as gray.
 
 The function either returns NULL on failure (invalid data, or malloc or fopen
 failed) or a pointer to the decoded pixels. On success, the qoi_desc struct
@@ -267,7 +291,7 @@ void *qoi_read(const char *filename, qoi_desc *desc, int channels);
 #endif /* QOI_NO_STDIO */
 
 
-/* Encode raw RGB or RGBA pixels into a QOI image in memory.
+/* Encode raw gray, RGB or RGBA pixels into a QOI image in memory.
 
 The function either returns NULL on failure (invalid parameters or malloc
 failed) or a pointer to the encoded data on success. On success the out_len
@@ -316,6 +340,8 @@ Implementation */
 #define QOI_OP_RUN    0xc0 /* 11xxxxxx */
 #define QOI_OP_RGB    0xfe /* 11111110 */
 #define QOI_OP_RGBA   0xff /* 11111111 */
+#define QOI_OP_GRAY   0xff /* 11111111 - takes the place of QOI_OP_RGBA in
+                              single channel (gray) files */
 
 #define QOI_MASK_2    0xc0 /* 11000000 */
 
@@ -364,7 +390,7 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	if (
 		data == NULL || out_len == NULL || desc == NULL ||
 		desc->width == 0 || desc->height == 0 ||
-		desc->channels < 3 || desc->channels > 4 ||
+		desc->channels == 0 || desc->channels == 2 || desc->channels > 4 ||
 		desc->colorspace > 1 ||
 		desc->height >= QOI_PIXELS_MAX / desc->width
 	) {
@@ -404,12 +430,20 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	channels = desc->channels;
 
 	for (px_pos = 0; px_pos < px_len; px_pos += channels) {
-		px.rgba.r = pixels[px_pos + 0];
-		px.rgba.g = pixels[px_pos + 1];
-		px.rgba.b = pixels[px_pos + 2];
+		if (channels == 1) {
+			px.rgba.r = pixels[px_pos];
+			px.rgba.g = pixels[px_pos];
+			px.rgba.b = pixels[px_pos];
+			px.rgba.a = 255;
+		}
+		else {
+			px.rgba.r = pixels[px_pos + 0];
+			px.rgba.g = pixels[px_pos + 1];
+			px.rgba.b = pixels[px_pos + 2];
 
-		if (channels == 4) {
-			px.rgba.a = pixels[px_pos + 3];
+			if (channels == 4) {
+				px.rgba.a = pixels[px_pos + 3];
+			}
 		}
 
 		if (px.v == px_prev.v) {
@@ -458,6 +492,10 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 						bytes[p++] = QOI_OP_LUMA     | (vg   + 32);
 						bytes[p++] = (vg_r + 8) << 4 | (vg_b +  8);
 					}
+					else if (channels == 1) {
+						bytes[p++] = QOI_OP_GRAY;
+						bytes[p++] = px.rgba.r;
+					}
 					else {
 						bytes[p++] = QOI_OP_RGB;
 						bytes[p++] = px.rgba.r;
@@ -496,7 +534,7 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 
 	if (
 		data == NULL || desc == NULL ||
-		(channels != 0 && channels != 3 && channels != 4) ||
+		(channels != 0 && channels != 1 && channels != 3 && channels != 4) ||
 		size < QOI_HEADER_SIZE + (int)sizeof(qoi_padding)
 	) {
 		return NULL;
@@ -512,7 +550,7 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 
 	if (
 		desc->width == 0 || desc->height == 0 ||
-		desc->channels < 3 || desc->channels > 4 ||
+		desc->channels == 0 || desc->channels == 2 || desc->channels > 4 ||
 		desc->colorspace > 1 ||
 		header_magic != QOI_MAGIC ||
 		desc->height >= QOI_PIXELS_MAX / desc->width
@@ -522,6 +560,11 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 
 	if (channels == 0) {
 		channels = desc->channels;
+	}
+
+	if (channels == 1 && desc->channels != 1) {
+		/* Single channel output is only valid for gray files. */
+		return NULL;
 	}
 
 	px_len = desc->width * desc->height * channels;
@@ -550,10 +593,19 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 				px.rgba.b = bytes[p++];
 			}
 			else if (b1 == QOI_OP_RGBA) {
-				px.rgba.r = bytes[p++];
-				px.rgba.g = bytes[p++];
-				px.rgba.b = bytes[p++];
-				px.rgba.a = bytes[p++];
+				if (desc->channels == 1) {
+					px.rgba.r = bytes[p];
+					px.rgba.g = bytes[p];
+					px.rgba.b = bytes[p];
+					px.rgba.a = 255;
+					p++;
+				}
+				else {
+					px.rgba.r = bytes[p++];
+					px.rgba.g = bytes[p++];
+					px.rgba.b = bytes[p++];
+					px.rgba.a = bytes[p++];
+				}
 			}
 			else if ((b1 & QOI_MASK_2) == QOI_OP_INDEX) {
 				px = index[b1];
@@ -577,12 +629,26 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 			index[QOI_COLOR_HASH(px) & (64 - 1)] = px;
 		}
 
-		pixels[px_pos + 0] = px.rgba.r;
-		pixels[px_pos + 1] = px.rgba.g;
-		pixels[px_pos + 2] = px.rgba.b;
-		
-		if (channels == 4) {
-			pixels[px_pos + 3] = px.rgba.a;
+		if (
+			desc->channels == 1 &&
+			(px.rgba.r != px.rgba.g || px.rgba.g != px.rgba.b || px.rgba.a != 255)
+		) {
+			/* A gray file must not decode to color pixels. */
+			QOI_FREE(pixels);
+			return NULL;
+		}
+
+		if (channels == 1) {
+			pixels[px_pos] = px.rgba.r;
+		}
+		else {
+			pixels[px_pos + 0] = px.rgba.r;
+			pixels[px_pos + 1] = px.rgba.g;
+			pixels[px_pos + 2] = px.rgba.b;
+
+			if (channels == 4) {
+				pixels[px_pos + 3] = px.rgba.a;
+			}
 		}
 	}
 
