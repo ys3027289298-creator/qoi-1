@@ -45,6 +45,8 @@ This library provides the following functions;
 - qoi_decode  -- decode the raw bytes of a QOI image from memory
 - qoi_write   -- encode and write a QOI file
 - qoi_encode  -- encode an rgba buffer into a QOI image in memory
+- qoi_decode_rotated -- decode a rotated QOI image back into an upright buffer
+- qoi_encode_rotated -- encode a buffer after physically rotating its pixels
 
 See the function declaration below for the signature and more information.
 
@@ -233,6 +235,15 @@ how chunks are en-/decoded. */
 #define QOI_SRGB   0
 #define QOI_LINEAR 1
 
+/* Rotation angles for qoi_encode_rotated() and qoi_decode_rotated(), in
+degrees clockwise. The rotation rearranges the actual pixels; no metadata is
+written to the QOI stream. */
+
+#define QOI_ROTATE_0   0
+#define QOI_ROTATE_90  90
+#define QOI_ROTATE_180 180
+#define QOI_ROTATE_270 270
+
 typedef struct {
 	unsigned int width;
 	unsigned int height;
@@ -287,6 +298,30 @@ is filled with the description from the file header.
 The returned pixel data should be free()d after use. */
 
 void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels);
+
+
+/* Like qoi_encode(), but the pixel buffer is physically rotated clockwise by
+the given angle (QOI_ROTATE_0, QOI_ROTATE_90, QOI_ROTATE_180 or
+QOI_ROTATE_270) before encoding. The pixels are rearranged in memory; the QOI
+stream only ever contains ordinary pixel data and no rotation information.
+For 90 and 270 degrees the width and height of the encoded image are swapped.
+
+QOI_ROTATE_0 is routed through qoi_encode() unchanged and produces byte
+identical output. Any other angle makes the function return NULL. */
+
+void *qoi_encode_rotated(const void *data, const qoi_desc *desc, int rotation,
+	int *out_len);
+
+
+/* Counterpart to qoi_encode_rotated(): decodes a QOI stream that was encoded
+with the given rotation and rotates the pixels back, so the caller always
+receives an upright image with the original width and height. The angle must
+match the one used for encoding and must be one of QOI_ROTATE_0,
+QOI_ROTATE_90, QOI_ROTATE_180 or QOI_ROTATE_270; any other value returns NULL.
+QOI_ROTATE_0 is routed through qoi_decode() unchanged. */
+
+void *qoi_decode_rotated(const void *data, int size, qoi_desc *desc,
+	int channels, int rotation);
 
 
 #ifdef __cplusplus
@@ -587,6 +622,157 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 	}
 
 	return pixels;
+}
+
+/* Physically rotate an RGBA/RGB pixel buffer clockwise by 90, 180 or 270
+degrees. For 90/270 degrees the destination width and height are swapped.
+Returns a QOI_MALLOC'd buffer (to be QOI_FREE'd by the caller) or NULL. */
+
+static unsigned char *qoi_rotate_pixels(const unsigned char *pixels,
+	unsigned int width, unsigned int height, int channels, int rotation)
+{
+	unsigned int dst_width = (rotation == QOI_ROTATE_180) ? width : height;
+	unsigned int dst_height = (rotation == QOI_ROTATE_180) ? height : width;
+	unsigned int total = dst_width * dst_height * (unsigned int)channels;
+	unsigned char *rotated;
+	unsigned int x, y;
+
+	rotated = (unsigned char *)QOI_MALLOC(total);
+	if (!rotated) {
+		return NULL;
+	}
+
+	for (y = 0; y < height; y++) {
+		for (x = 0; x < width; x++) {
+			unsigned int rx, ry;
+			const unsigned char *src;
+			unsigned char *dst;
+
+			if (rotation == QOI_ROTATE_90) {
+				rx = height - 1 - y;
+				ry = x;
+			}
+			else if (rotation == QOI_ROTATE_270) {
+				rx = y;
+				ry = width - 1 - x;
+			}
+			else { /* QOI_ROTATE_180 */
+				rx = width - 1 - x;
+				ry = height - 1 - y;
+			}
+
+			src = pixels + (y * width + x) * (unsigned int)channels;
+			dst = rotated + (ry * dst_width + rx) * (unsigned int)channels;
+			{
+				int c;
+				for (c = 0; c < channels; c++) {
+					dst[c] = src[c];
+				}
+			}
+		}
+	}
+
+	return rotated;
+}
+
+static int qoi_rotation_valid(int rotation) {
+	return rotation == QOI_ROTATE_0 || rotation == QOI_ROTATE_90 ||
+		rotation == QOI_ROTATE_180 || rotation == QOI_ROTATE_270;
+}
+
+void *qoi_encode_rotated(const void *data, const qoi_desc *desc, int rotation,
+	int *out_len)
+{
+	qoi_desc rotated_desc;
+	unsigned char *rotated_pixels;
+	unsigned char *encoded;
+
+	if (!qoi_rotation_valid(rotation) || data == NULL || desc == NULL ||
+		out_len == NULL ||
+		desc->width == 0 || desc->height == 0 ||
+		desc->channels < 3 || desc->channels > 4 ||
+		desc->colorspace > 1 ||
+		desc->height >= QOI_PIXELS_MAX / desc->width)
+	{
+		return NULL;
+	}
+
+	if (rotation == QOI_ROTATE_0) {
+		return qoi_encode(data, desc, out_len);
+	}
+
+	rotated_pixels = qoi_rotate_pixels((const unsigned char *)data,
+		desc->width, desc->height, desc->channels, rotation);
+	if (!rotated_pixels) {
+		return NULL;
+	}
+
+	rotated_desc = *desc;
+	if (rotation == QOI_ROTATE_90 || rotation == QOI_ROTATE_270) {
+		rotated_desc.width = desc->height;
+		rotated_desc.height = desc->width;
+	}
+
+	encoded = (unsigned char *)qoi_encode(rotated_pixels, &rotated_desc,
+		out_len);
+	QOI_FREE(rotated_pixels);
+	return encoded;
+}
+
+void *qoi_decode_rotated(const void *data, int size, qoi_desc *desc,
+	int channels, int rotation)
+{
+	unsigned int stored_width, stored_height;
+	unsigned char *decoded;
+	unsigned char *upright;
+	qoi_desc decoded_desc;
+
+	if (!qoi_rotation_valid(rotation)) {
+		return NULL;
+	}
+
+	if (rotation == QOI_ROTATE_0) {
+		return qoi_decode(data, size, desc, channels);
+	}
+
+	decoded = (unsigned char *)qoi_decode(data, size, &decoded_desc,
+		channels);
+	if (!decoded) {
+		return NULL;
+	}
+
+	if (channels == 0) {
+		channels = decoded_desc.channels;
+	}
+
+	stored_width = decoded_desc.width;
+	stored_height = decoded_desc.height;
+
+	/* Undo the encoder rotation by applying the complementary angle, so the
+	caller gets the upright image with the original width and height. */
+	if (rotation == QOI_ROTATE_90) {
+		rotation = QOI_ROTATE_270;
+	}
+	else if (rotation == QOI_ROTATE_270) {
+		rotation = QOI_ROTATE_90;
+	}
+
+	upright = qoi_rotate_pixels(decoded, stored_width, stored_height,
+		channels, rotation);
+	QOI_FREE(decoded);
+	if (!upright) {
+		return NULL;
+	}
+
+	if (desc) {
+		*desc = decoded_desc;
+		desc->width = (rotation == QOI_ROTATE_180) ?
+			stored_width : stored_height;
+		desc->height = (rotation == QOI_ROTATE_180) ?
+			stored_height : stored_width;
+	}
+
+	return upright;
 }
 
 #ifndef QOI_NO_STDIO
