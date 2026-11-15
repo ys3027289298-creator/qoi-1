@@ -41,10 +41,11 @@ void *rgba_pixels = qoi_read("image.qoi", &desc, 4);
 -- Documentation
 
 This library provides the following functions;
-- qoi_read    -- read and decode a QOI file
-- qoi_decode  -- decode the raw bytes of a QOI image from memory
-- qoi_write   -- encode and write a QOI file
-- qoi_encode  -- encode an rgba buffer into a QOI image in memory
+- qoi_read            -- read and decode a QOI file
+- qoi_decode          -- decode the raw bytes of a QOI image from memory
+- qoi_write           -- encode and write a QOI file
+- qoi_encode          -- encode an rgba buffer into a QOI image in memory
+- qoi_encode_negative -- like qoi_encode, but stores a negative (inverted) image
 
 See the function declaration below for the signature and more information.
 
@@ -69,7 +70,18 @@ struct qoi_header_t {
 	uint32_t height;     // image height in pixels (BE)
 	uint8_t  channels;   // 3 = RGB, 4 = RGBA
 	uint8_t  colorspace; // 0 = sRGB with linear alpha, 1 = all channels linear
+	                     // bit 7 (0x80, QOI_NEGATIVE): negative/inverted image
 };
+
+The colorspace byte holds the colorspace in the low bits and may optionally
+carry the QOI_NEGATIVE flag (0x80) in its most significant bit. The flag is
+independent of the channels byte. If QOI_NEGATIVE is set, the stored pixel
+data is the per-channel inverse (255 - v) of the r, g and b channels of the
+original image; the alpha channel is stored unmodified. A decoder must
+transparently re-invert the r, g and b channels after decoding, so the caller
+always receives the original image. Bits of the colorspace byte other than
+QOI_NEGATIVE and the colorspace value itself (0 or 1) are reserved; a decoder
+must reject files where any of these bits are set.
 
 Images are encoded row by row, left to right, top to bottom. The decoder and
 encoder start with {r: 0, g: 0, b: 0, a: 255} as the previous pixel value. An
@@ -233,6 +245,13 @@ how chunks are en-/decoded. */
 #define QOI_SRGB   0
 #define QOI_LINEAR 1
 
+/* Flag for the most significant bit of the colorspace header byte. If set,
+the image is stored as a negative: the r, g and b channels are inverted
+(255 - v) before encoding and transparently re-inverted by qoi_decode and
+qoi_read. The alpha channel is never inverted. */
+
+#define QOI_NEGATIVE 0x80
+
 typedef struct {
 	unsigned int width;
 	unsigned int height;
@@ -276,6 +295,21 @@ is set to the size in bytes of the encoded data.
 The returned qoi data should be free()d after use. */
 
 void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len);
+
+
+/* Encode raw RGB or RGBA pixels into a QOI image in memory, storing a
+negative of the image: the r, g and b channels are inverted (255 - v) before
+encoding and the QOI_NEGATIVE flag is set in the file header. The alpha
+channel is not inverted. qoi_decode and qoi_read transparently re-invert the
+channels, so decoding yields the original image.
+
+The function either returns NULL on failure (invalid parameters or malloc
+failed) or a pointer to the encoded data on success. On success the out_len
+is set to the size in bytes of the encoded data.
+
+The returned qoi data should be free()d after use. */
+
+void *qoi_encode_negative(const void *data, const qoi_desc *desc, int *out_len);
 
 
 /* Decode a QOI image from memory.
@@ -353,13 +387,14 @@ static unsigned int qoi_read_32(const unsigned char *bytes, int *p) {
 	return a << 24 | b << 16 | c << 8 | d;
 }
 
-void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
+static void *qoi_encode_impl(const void *data, const qoi_desc *desc, int *out_len, int negative) {
 	int i, max_size, p, run;
 	int px_len, px_end, px_pos, channels;
 	unsigned char *bytes;
 	const unsigned char *pixels;
 	qoi_rgba_t index[64];
 	qoi_rgba_t px, px_prev;
+	unsigned char neg_mask;
 
 	if (
 		data == NULL || out_len == NULL || desc == NULL ||
@@ -385,12 +420,14 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	qoi_write_32(bytes, &p, desc->width);
 	qoi_write_32(bytes, &p, desc->height);
 	bytes[p++] = desc->channels;
-	bytes[p++] = desc->colorspace;
+	bytes[p++] = desc->colorspace | (negative ? QOI_NEGATIVE : 0);
 
 
 	pixels = (const unsigned char *)data;
 
 	QOI_ZEROARR(index);
+
+	neg_mask = negative ? 0xff : 0x00;
 
 	run = 0;
 	px_prev.rgba.r = 0;
@@ -404,9 +441,9 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	channels = desc->channels;
 
 	for (px_pos = 0; px_pos < px_len; px_pos += channels) {
-		px.rgba.r = pixels[px_pos + 0];
-		px.rgba.g = pixels[px_pos + 1];
-		px.rgba.b = pixels[px_pos + 2];
+		px.rgba.r = pixels[px_pos + 0] ^ neg_mask;
+		px.rgba.g = pixels[px_pos + 1] ^ neg_mask;
+		px.rgba.b = pixels[px_pos + 2] ^ neg_mask;
 
 		if (channels == 4) {
 			px.rgba.a = pixels[px_pos + 3];
@@ -485,6 +522,14 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	return bytes;
 }
 
+void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
+	return qoi_encode_impl(data, desc, out_len, 0);
+}
+
+void *qoi_encode_negative(const void *data, const qoi_desc *desc, int *out_len) {
+	return qoi_encode_impl(data, desc, out_len, 1);
+}
+
 void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 	const unsigned char *bytes;
 	unsigned int header_magic;
@@ -493,6 +538,8 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 	qoi_rgba_t px;
 	int px_len, chunks_len, px_pos;
 	int p = 0, run = 0;
+	int negative;
+	unsigned char header_colorspace;
 
 	if (
 		data == NULL || desc == NULL ||
@@ -508,17 +555,20 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 	desc->width = qoi_read_32(bytes, &p);
 	desc->height = qoi_read_32(bytes, &p);
 	desc->channels = bytes[p++];
-	desc->colorspace = bytes[p++];
+	header_colorspace = bytes[p++];
 
 	if (
 		desc->width == 0 || desc->height == 0 ||
 		desc->channels < 3 || desc->channels > 4 ||
-		desc->colorspace > 1 ||
+		(header_colorspace & ~(QOI_NEGATIVE | QOI_LINEAR)) != 0 ||
 		header_magic != QOI_MAGIC ||
 		desc->height >= QOI_PIXELS_MAX / desc->width
 	) {
 		return NULL;
 	}
+
+	negative = (header_colorspace & QOI_NEGATIVE) != 0;
+	desc->colorspace = header_colorspace & QOI_LINEAR;
 
 	if (channels == 0) {
 		channels = desc->channels;
@@ -583,6 +633,14 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 		
 		if (channels == 4) {
 			pixels[px_pos + 3] = px.rgba.a;
+		}
+	}
+
+	if (negative) {
+		for (px_pos = 0; px_pos < px_len; px_pos += channels) {
+			pixels[px_pos + 0] = 255 - pixels[px_pos + 0];
+			pixels[px_pos + 1] = 255 - pixels[px_pos + 1];
+			pixels[px_pos + 2] = 255 - pixels[px_pos + 2];
 		}
 	}
 
