@@ -289,6 +289,84 @@ The returned pixel data should be free()d after use. */
 void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels);
 
 
+/* -----------------------------------------------------------------------------
+Indexed color pipeline: median-cut palette quantization, index mapping and
+two lossless encodings for the index array (run-length and optional delta).
+These functions are independent of the QOI en-/decoder above and do not
+change its behavior in any way. */
+
+#define QOI_PALETTE_MAX 256
+
+typedef struct {
+	unsigned char r, g, b, a;
+} qoi_palette_color_t;
+
+/* Build a palette of num_colors colors from the given pixels using
+median-cut quantization. channels must be 3 (RGB) or 4 (RGBA), num_colors
+must be in the range 2..QOI_PALETTE_MAX.
+
+The function returns the number of palette entries written to palette_out
+(which must hold at least num_colors entries) or 0 on invalid parameters.
+Fewer than num_colors entries may be returned if the image contains fewer
+distinct colors. */
+
+int qoi_palette_build(const void *pixels, int width, int height, int channels,
+	int num_colors, qoi_palette_color_t *palette_out);
+
+/* Map every pixel to the nearest palette entry (least squared error over
+all channels). indices_out must hold width*height bytes.
+
+The function returns 0 on success, -1 on invalid parameters. */
+
+int qoi_palette_map(const void *pixels, int width, int height, int channels,
+	const qoi_palette_color_t *palette, int num_colors,
+	unsigned char *indices_out);
+
+/* Reconstruct pixels from an index array and a palette. pixels_out must
+hold count*channels bytes.
+
+The function returns 0 on success, -1 on invalid parameters or if an index
+is out of range. */
+
+int qoi_palette_apply(const unsigned char *indices, int count,
+	const qoi_palette_color_t *palette, int num_colors, int channels,
+	void *pixels_out);
+
+/* Encode an index array with run-length encoding. A header byte < 0x80
+introduces a literal block of (header+1) indices, a header byte >= 0x80 a
+run of (header-0x7f) copies of the single index that follows it.
+
+The function returns the encoded size in bytes or -1 on invalid parameters
+or if out_cap is too small. */
+
+int qoi_index_encode_rle(const unsigned char *indices, int count,
+	unsigned char *out, int out_cap);
+
+/* Encode an index array, optionally with delta coding. With use_delta == 0
+the indices are copied verbatim. With use_delta != 0 the first index is
+stored verbatim and every following index as a zig-zag encoded varint of
+its difference to the previous index.
+
+The function returns the encoded size in bytes or -1 on invalid parameters
+or if out_cap is too small. */
+
+int qoi_index_encode_delta(const unsigned char *indices, int count,
+	int use_delta, unsigned char *out, int out_cap);
+
+/* Decode data produced by qoi_index_encode_rle() back into exactly count
+indices. The function returns 0 on success, -1 on malformed input. */
+
+int qoi_index_decode_rle(const unsigned char *in, int in_len,
+	unsigned char *indices_out, int count);
+
+/* Decode data produced by qoi_index_encode_delta() back into exactly count
+indices. use_delta must match the value used for encoding. The function
+returns 0 on success, -1 on malformed input. */
+
+int qoi_index_decode_delta(const unsigned char *in, int in_len,
+	int use_delta, unsigned char *indices_out, int count);
+
+
 #ifdef __cplusplus
 }
 #endif
@@ -646,4 +724,351 @@ void *qoi_read(const char *filename, qoi_desc *desc, int channels) {
 }
 
 #endif /* QOI_NO_STDIO */
+
+
+/* -----------------------------------------------------------------------------
+Indexed color pipeline implementation */
+
+typedef struct {
+	int start;
+	int len;
+	int channel;
+	int range;
+} qoi_mc_box_t;
+
+static int qoi_mc_sort_channel;
+
+static int qoi_mc_cmp(const void *pa, const void *pb) {
+	const unsigned char *a = (const unsigned char *)pa;
+	const unsigned char *b = (const unsigned char *)pb;
+	int c, d;
+	d = (int)a[qoi_mc_sort_channel] - (int)b[qoi_mc_sort_channel];
+	if (d) return d;
+	for (c = 0; c < 4; c++) {
+		d = (int)a[c] - (int)b[c];
+		if (d) return d;
+	}
+	return 0;
+}
+
+static void qoi_mc_measure(const qoi_palette_color_t *colors, qoi_mc_box_t *box) {
+	unsigned char cmin[4] = {255, 255, 255, 255};
+	unsigned char cmax[4] = {0, 0, 0, 0};
+	int j, c, best_c = 0, best_range = 0;
+	if (box->len < 2) {
+		box->channel = 0;
+		box->range = 0;
+		return;
+	}
+	for (j = box->start; j < box->start + box->len; j++) {
+		const unsigned char *px = (const unsigned char *)&colors[j];
+		for (c = 0; c < 4; c++) {
+			if (px[c] < cmin[c]) cmin[c] = px[c];
+			if (px[c] > cmax[c]) cmax[c] = px[c];
+		}
+	}
+	for (c = 0; c < 4; c++) {
+		int range = (int)cmax[c] - (int)cmin[c];
+		if (range > best_range) {
+			best_range = range;
+			best_c = c;
+		}
+	}
+	box->channel = best_c;
+	box->range = best_range;
+}
+
+int qoi_palette_build(const void *pixels, int width, int height, int channels,
+	int num_colors, qoi_palette_color_t *palette_out) {
+
+	qoi_palette_color_t *colors;
+	qoi_mc_box_t boxes[QOI_PALETTE_MAX];
+	int px_count, num_boxes, i, c;
+
+	if (
+		!pixels || !palette_out ||
+		width <= 0 || height <= 0 ||
+		(channels != 3 && channels != 4) ||
+		num_colors < 2 || num_colors > QOI_PALETTE_MAX ||
+		(unsigned int)width * (unsigned int)height > QOI_PIXELS_MAX
+	) {
+		return 0;
+	}
+
+	px_count = width * height;
+	colors = (qoi_palette_color_t *)QOI_MALLOC(px_count * sizeof(qoi_palette_color_t));
+	if (!colors) {
+		return 0;
+	}
+
+	{
+		const unsigned char *src = (const unsigned char *)pixels;
+		for (i = 0; i < px_count; i++, src += channels) {
+			colors[i].r = src[0];
+			colors[i].g = src[1];
+			colors[i].b = src[2];
+			colors[i].a = (channels == 4) ? src[3] : 255;
+		}
+	}
+
+	boxes[0].start = 0;
+	boxes[0].len = px_count;
+	num_boxes = 1;
+	qoi_mc_measure(colors, &boxes[0]);
+
+	while (num_boxes < num_colors) {
+		int split = -1, split_range = 0;
+		for (i = 0; i < num_boxes; i++) {
+			if (boxes[i].range > split_range) {
+				split_range = boxes[i].range;
+				split = i;
+			}
+		}
+		if (split < 0) {
+			break; /* no box can be split any further */
+		}
+		{
+			qoi_mc_box_t *box = &boxes[split];
+			qoi_mc_sort_channel = box->channel;
+			qsort(colors + box->start, box->len, sizeof(qoi_palette_color_t), qoi_mc_cmp);
+			boxes[num_boxes].start = box->start + box->len / 2;
+			boxes[num_boxes].len = box->len - box->len / 2;
+			box->len = box->len / 2;
+			qoi_mc_measure(colors, box);
+			qoi_mc_measure(colors, &boxes[num_boxes]);
+			num_boxes++;
+		}
+	}
+
+	for (i = 0; i < num_boxes; i++) {
+		unsigned int sum[4] = {0, 0, 0, 0};
+		int j;
+		for (j = boxes[i].start; j < boxes[i].start + boxes[i].len; j++) {
+			const unsigned char *px = (const unsigned char *)&colors[j];
+			for (c = 0; c < 4; c++) {
+				sum[c] += px[c];
+			}
+		}
+		for (c = 0; c < 4; c++) {
+			((unsigned char *)&palette_out[i])[c] =
+				(unsigned char)((sum[c] + boxes[i].len / 2) / boxes[i].len);
+		}
+	}
+
+	QOI_FREE(colors);
+	return num_boxes;
+}
+
+int qoi_palette_map(const void *pixels, int width, int height, int channels,
+	const qoi_palette_color_t *palette, int num_colors,
+	unsigned char *indices_out) {
+
+	int px_count, i, k;
+	const unsigned char *src;
+
+	if (
+		!pixels || !palette || !indices_out ||
+		width <= 0 || height <= 0 ||
+		(channels != 3 && channels != 4) ||
+		num_colors < 1 || num_colors > QOI_PALETTE_MAX ||
+		(unsigned int)width * (unsigned int)height > QOI_PIXELS_MAX
+	) {
+		return -1;
+	}
+
+	px_count = width * height;
+	src = (const unsigned char *)pixels;
+	for (i = 0; i < px_count; i++, src += channels) {
+		int best = 0;
+		unsigned int best_err = 0xffffffff;
+		unsigned char pa = (channels == 4) ? src[3] : 255;
+		for (k = 0; k < num_colors; k++) {
+			int dr = (int)src[0] - palette[k].r;
+			int dg = (int)src[1] - palette[k].g;
+			int db = (int)src[2] - palette[k].b;
+			int da = (int)pa - palette[k].a;
+			unsigned int err = (unsigned int)(dr*dr + dg*dg + db*db + da*da);
+			if (err < best_err) {
+				best_err = err;
+				best = k;
+			}
+		}
+		indices_out[i] = (unsigned char)best;
+	}
+	return 0;
+}
+
+int qoi_palette_apply(const unsigned char *indices, int count,
+	const qoi_palette_color_t *palette, int num_colors, int channels,
+	void *pixels_out) {
+
+	int i;
+	unsigned char *dst;
+
+	if (
+		!indices || !palette || !pixels_out || count < 0 ||
+		(channels != 3 && channels != 4) ||
+		num_colors < 1 || num_colors > QOI_PALETTE_MAX
+	) {
+		return -1;
+	}
+
+	dst = (unsigned char *)pixels_out;
+	for (i = 0; i < count; i++) {
+		const qoi_palette_color_t *c;
+		if (indices[i] >= num_colors) {
+			return -1;
+		}
+		c = &palette[indices[i]];
+		dst[0] = c->r;
+		dst[1] = c->g;
+		dst[2] = c->b;
+		if (channels == 4) {
+			dst[3] = c->a;
+		}
+		dst += channels;
+	}
+	return 0;
+}
+
+int qoi_index_encode_rle(const unsigned char *indices, int count,
+	unsigned char *out, int out_cap) {
+
+	int i = 0, p = 0;
+
+	if (!indices || !out || count < 0 || out_cap < 0) {
+		return -1;
+	}
+
+	while (i < count) {
+		int run = 1;
+		while (i + run < count && indices[i + run] == indices[i] && run < 128) {
+			run++;
+		}
+		if (run >= 2) {
+			if (p + 2 > out_cap) return -1;
+			out[p++] = (unsigned char)(0x80 | (run - 1));
+			out[p++] = indices[i];
+			i += run;
+		}
+		else {
+			int lit_start = i, lit_len = 0;
+			while (i < count && lit_len < 128) {
+				run = 1;
+				while (i + run < count && indices[i + run] == indices[i] && run < 128) {
+					run++;
+				}
+				if (run >= 2) break;
+				i += run;
+				lit_len += run;
+			}
+			if (p + 1 + lit_len > out_cap) return -1;
+			out[p++] = (unsigned char)(lit_len - 1);
+			memcpy(out + p, indices + lit_start, lit_len);
+			p += lit_len;
+		}
+	}
+	return p;
+}
+
+int qoi_index_decode_rle(const unsigned char *in, int in_len,
+	unsigned char *indices_out, int count) {
+
+	int p = 0, o = 0;
+
+	if (!in || !indices_out || in_len < 0 || count < 0) {
+		return -1;
+	}
+
+	while (p < in_len) {
+		int header = in[p++];
+		if (header < 0x80) {
+			int lit_len = header + 1;
+			if (p + lit_len > in_len || o + lit_len > count) return -1;
+			memcpy(indices_out + o, in + p, lit_len);
+			p += lit_len;
+			o += lit_len;
+		}
+		else {
+			int run = (header & 0x7f) + 1;
+			if (p + 1 > in_len || o + run > count) return -1;
+			memset(indices_out + o, in[p++], run);
+			o += run;
+		}
+	}
+	return (o == count) ? 0 : -1;
+}
+
+int qoi_index_encode_delta(const unsigned char *indices, int count,
+	int use_delta, unsigned char *out, int out_cap) {
+
+	int i, p = 0;
+
+	if (!indices || !out || count < 0 || out_cap < 0) {
+		return -1;
+	}
+
+	if (!use_delta) {
+		if (count > out_cap) return -1;
+		memcpy(out, indices, count);
+		return count;
+	}
+
+	for (i = 0; i < count; i++) {
+		if (i == 0) {
+			if (p + 1 > out_cap) return -1;
+			out[p++] = indices[0];
+		}
+		else {
+			int d = (int)indices[i] - (int)indices[i - 1];
+			unsigned int zz = (unsigned int)((d << 1) ^ (d >> 31));
+			do {
+				unsigned char byte = (unsigned char)(zz & 0x7f);
+				zz >>= 7;
+				if (p + 1 > out_cap) return -1;
+				out[p++] = byte | (zz ? 0x80 : 0);
+			} while (zz);
+		}
+	}
+	return p;
+}
+
+int qoi_index_decode_delta(const unsigned char *in, int in_len,
+	int use_delta, unsigned char *indices_out, int count) {
+
+	int i, p = 0;
+
+	if (!in || !indices_out || in_len < 0 || count < 0) {
+		return -1;
+	}
+
+	if (!use_delta) {
+		if (in_len != count) return -1;
+		memcpy(indices_out, in, count);
+		return 0;
+	}
+
+	if (count == 0) {
+		return (in_len == 0) ? 0 : -1;
+	}
+
+	if (p >= in_len) return -1;
+	indices_out[0] = in[p++];
+	for (i = 1; i < count; i++) {
+		unsigned int zz = 0;
+		int shift = 0, byte, d, idx;
+		do {
+			if (p >= in_len || shift > 28) return -1;
+			byte = in[p++];
+			zz |= (unsigned int)(byte & 0x7f) << shift;
+			shift += 7;
+		} while (byte & 0x80);
+		d = (int)(zz >> 1) ^ -(int)(zz & 1);
+		idx = (int)indices_out[i - 1] + d;
+		if (idx < 0 || idx > 255) return -1;
+		indices_out[i] = (unsigned char)idx;
+	}
+	return (p == in_len) ? 0 : -1;
+}
+
 #endif /* QOI_IMPLEMENTATION */
