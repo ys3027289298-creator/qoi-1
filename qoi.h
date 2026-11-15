@@ -45,6 +45,9 @@ This library provides the following functions;
 - qoi_decode  -- decode the raw bytes of a QOI image from memory
 - qoi_write   -- encode and write a QOI file
 - qoi_encode  -- encode an rgba buffer into a QOI image in memory
+- qoi_encode_predictive -- encode with one fixed prediction filter
+- qoi_encode_adaptive   -- encode with per-block adaptive prediction
+- qoi_decode_predictive -- decode a prediction filtered stream
 
 See the function declaration below for the signature and more information.
 
@@ -287,6 +290,100 @@ is filled with the description from the file header.
 The returned pixel data should be free()d after use. */
 
 void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels);
+
+
+/* --- Prediction filtered streams ("qoip") ---
+
+Different source material compresses better with different spatial
+predictors. A prediction filtered stream subtracts a per-pixel prediction
+from the image and stores the wraparound residuals as a regular QOI image,
+so the plain qoi_encode()/qoi_decode() bitstream is not changed in any way.
+
+Four predictors are available, identified by the QOI_PREDICTOR_* constants
+below: the left neighbor, the upper neighbor, the upper left neighbor and
+the floored average of the left and upper neighbors. Out of image neighbors
+count as 0. All predictors work per channel on already reconstructed pixels,
+so en- and decoder always agree.
+
+qoi_encode_predictive() filters the whole image with one fixed predictor.
+qoi_encode_adaptive() splits the image into square blocks of block_size
+pixels (16 is a good choice), scores every predictor by the sum of the
+absolute signed residuals inside each block and uses the best scoring
+predictor per block. The chosen predictor of every block is stored as a one
+byte block header in a row major predictor table right after the stream
+header. block_size must be between 1 and QOI_MAX_BLOCK_SIZE; any other value
+is invalid and reported as failure. Blocks at the right and bottom edge of
+the image are clipped to the image bounds.
+
+Stream layout (all multi-byte integers are big endian):
+
+	stream header (18 bytes)
+		char     magic[4];    // magic bytes "qoip"
+		uint32_t width;       // image width in pixels
+		uint32_t height;      // image height in pixels
+		uint8_t  channels;    // 3 = RGB, 4 = RGBA
+		uint8_t  colorspace;  // 0 = sRGB, 1 = linear (informative only)
+		uint8_t  mode;        // 0 = fixed predictor, 1 = adaptive blocks
+		uint8_t  predictor;   // predictor for the whole image if mode == 0
+		uint16_t block_size;  // block edge length if mode == 1, else 0
+
+	if mode == 1: ceil(width/block_size) * ceil(height/block_size)
+	predictor bytes, one per block, in row major order
+
+	a regular QOI image ("qoif" ...) holding the prediction residuals
+
+Each residual byte is the wraparound difference (value - predictor) of one
+channel, so reconstruction is simply (predictor + residual) & 0xff. */
+
+#define QOI_PREDICTOR_LEFT    0
+#define QOI_PREDICTOR_UP      1
+#define QOI_PREDICTOR_UP_LEFT 2
+#define QOI_PREDICTOR_AVERAGE 3
+
+#define QOI_MAX_BLOCK_SIZE 256
+
+/* Encode raw RGB or RGBA pixels into a prediction filtered stream in
+memory, using the single fixed predictor QOI_PREDICTOR_* for the whole
+image.
+
+The function either returns NULL on failure (invalid parameters or malloc
+failed) or a pointer to the encoded data on success. On success the out_len
+is set to the size in bytes of the encoded data.
+
+The returned data should be free()d after use. */
+
+void *qoi_encode_predictive(const void *data, const qoi_desc *desc,
+	int predictor, int *out_len);
+
+
+/* Encode raw RGB or RGBA pixels into a prediction filtered stream in
+memory, choosing the best of the four QOI_PREDICTOR_* predictors per
+block_size x block_size block. block_size must be between 1 and
+QOI_MAX_BLOCK_SIZE; an invalid block size is reported as failure.
+
+The function either returns NULL on failure (invalid parameters or malloc
+failed) or a pointer to the encoded data on success. On success the out_len
+is set to the size in bytes of the encoded data.
+
+The returned data should be free()d after use. */
+
+void *qoi_encode_adaptive(const void *data, const qoi_desc *desc,
+	int block_size, int *out_len);
+
+
+/* Decode a prediction filtered stream produced by qoi_encode_predictive()
+or qoi_encode_adaptive() from memory. If channels is 0, the number of
+channels from the stream header is used. If channels is 3 or 4 the output
+format will be forced into this number of channels.
+
+The function either returns NULL on failure (invalid data or malloc failed)
+or a pointer to the decoded pixels. On success, the qoi_desc struct is
+filled with the description from the stream header.
+
+The returned pixel data should be free()d after use. */
+
+void *qoi_decode_predictive(const void *data, int size, qoi_desc *desc,
+	int channels);
 
 
 #ifdef __cplusplus
@@ -584,6 +681,351 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 		if (channels == 4) {
 			pixels[px_pos + 3] = px.rgba.a;
 		}
+	}
+
+	return pixels;
+}
+
+#define QOI_P_MAGIC \
+	(((unsigned int)'q') << 24 | ((unsigned int)'o') << 16 | \
+	 ((unsigned int)'i') <<  8 | ((unsigned int)'p'))
+#define QOI_P_HEADER_SIZE 18
+#define QOI_P_MODE_FIXED 0
+#define QOI_P_MODE_ADAPTIVE 1
+#define QOI_PREDICTOR_COUNT 4
+
+/* Evaluate one predictor for the pixel at (x, y) and channel c. Neighbors
+outside of the image bounds count as 0. */
+static int qoi_predict_sample(
+	const unsigned char *pixels, int width, int channels,
+	int x, int y, int c, int predictor
+) {
+	int left    = x > 0 ? pixels[(y * width + x - 1) * channels + c] : 0;
+	int up      = y > 0 ? pixels[((y - 1) * width + x) * channels + c] : 0;
+	int up_left = (x > 0 && y > 0)
+		? pixels[((y - 1) * width + x - 1) * channels + c] : 0;
+
+	switch (predictor) {
+		case QOI_PREDICTOR_LEFT:    return left;
+		case QOI_PREDICTOR_UP:      return up;
+		case QOI_PREDICTOR_UP_LEFT: return up_left;
+		default:                    return (left + up) >> 1;
+	}
+}
+
+static void *qoi_predictive_encode(
+	const void *data, const qoi_desc *desc,
+	int mode, int predictor, int block_size, int *out_len
+) {
+	const unsigned char *pixels;
+	unsigned char *residuals, *bytes, *pred_table;
+	void *payload;
+	qoi_desc residual_desc;
+	int width, height, channels, blocks_x, blocks_y, num_blocks;
+	int x, y, c, b, p, payload_len;
+
+	if (
+		data == NULL || desc == NULL || out_len == NULL ||
+		desc->width == 0 || desc->height == 0 ||
+		desc->channels < 3 || desc->channels > 4 ||
+		desc->colorspace > 1 ||
+		desc->height >= QOI_PIXELS_MAX / desc->width ||
+		(mode != QOI_P_MODE_FIXED && mode != QOI_P_MODE_ADAPTIVE) ||
+		(mode == QOI_P_MODE_FIXED &&
+			(predictor < 0 || predictor >= QOI_PREDICTOR_COUNT)) ||
+		(mode == QOI_P_MODE_ADAPTIVE &&
+			(block_size < 1 || block_size > QOI_MAX_BLOCK_SIZE))
+	) {
+		return NULL;
+	}
+
+	pixels = (const unsigned char *)data;
+	width = (int)desc->width;
+	height = (int)desc->height;
+	channels = desc->channels;
+	blocks_x = 0;
+	blocks_y = 0;
+	num_blocks = 0;
+	pred_table = NULL;
+
+	if (mode == QOI_P_MODE_ADAPTIVE) {
+		int bx, by;
+
+		blocks_x = (width + block_size - 1) / block_size;
+		blocks_y = (height + block_size - 1) / block_size;
+		num_blocks = blocks_x * blocks_y;
+
+		pred_table = (unsigned char *) QOI_MALLOC(num_blocks);
+		if (!pred_table) {
+			return NULL;
+		}
+
+		/* Score every predictor by the sum of the absolute signed
+		residuals inside the block and keep the best one. */
+		for (by = 0; by < blocks_y; by++) {
+			for (bx = 0; bx < blocks_x; bx++) {
+				long sums[QOI_PREDICTOR_COUNT] = {0, 0, 0, 0};
+				int x_end = (bx + 1) * block_size;
+				int y_end = (by + 1) * block_size;
+				int best;
+
+				if (x_end > width) {
+					x_end = width;
+				}
+				if (y_end > height) {
+					y_end = height;
+				}
+
+				for (y = by * block_size; y < y_end; y++) {
+					for (x = bx * block_size; x < x_end; x++) {
+						for (c = 0; c < channels; c++) {
+							int cur = pixels[(y * width + x) * channels + c];
+							for (b = 0; b < QOI_PREDICTOR_COUNT; b++) {
+								int r = cur - qoi_predict_sample(
+									pixels, width, channels, x, y, c, b);
+								r = r > 127 ? r - 256 : (r < -128 ? r + 256 : r);
+								sums[b] += r < 0 ? -r : r;
+							}
+						}
+					}
+				}
+
+				best = 0;
+				for (b = 1; b < QOI_PREDICTOR_COUNT; b++) {
+					if (sums[b] < sums[best]) {
+						best = b;
+					}
+				}
+				pred_table[by * blocks_x + bx] = (unsigned char)best;
+			}
+		}
+	}
+
+	/* Filter the image into wraparound residuals. */
+	residuals = (unsigned char *)
+		QOI_MALLOC((size_t)width * height * channels);
+	if (!residuals) {
+		if (pred_table) {
+			QOI_FREE(pred_table);
+		}
+		return NULL;
+	}
+
+	for (y = 0; y < height; y++) {
+		for (x = 0; x < width; x++) {
+			int pred_id = pred_table
+				? pred_table[(y / block_size) * blocks_x + x / block_size]
+				: predictor;
+			for (c = 0; c < channels; c++) {
+				int i = (y * width + x) * channels + c;
+				residuals[i] = (unsigned char)(pixels[i] -
+					qoi_predict_sample(pixels, width, channels, x, y, c,
+						pred_id));
+			}
+		}
+	}
+
+	residual_desc = *desc;
+	payload = qoi_encode(residuals, &residual_desc, &payload_len);
+	QOI_FREE(residuals);
+	if (!payload) {
+		if (pred_table) {
+			QOI_FREE(pred_table);
+		}
+		return NULL;
+	}
+
+	bytes = (unsigned char *)
+		QOI_MALLOC(QOI_P_HEADER_SIZE + num_blocks + payload_len);
+	if (!bytes) {
+		if (pred_table) {
+			QOI_FREE(pred_table);
+		}
+		QOI_FREE(payload);
+		return NULL;
+	}
+
+	p = 0;
+	qoi_write_32(bytes, &p, QOI_P_MAGIC);
+	qoi_write_32(bytes, &p, desc->width);
+	qoi_write_32(bytes, &p, desc->height);
+	bytes[p++] = desc->channels;
+	bytes[p++] = desc->colorspace;
+	bytes[p++] = (unsigned char)mode;
+	bytes[p++] = (unsigned char)(
+		mode == QOI_P_MODE_FIXED ? predictor : 0);
+	bytes[p++] = (unsigned char)(
+		mode == QOI_P_MODE_ADAPTIVE ? (block_size >> 8) & 0xff : 0);
+	bytes[p++] = (unsigned char)(
+		mode == QOI_P_MODE_ADAPTIVE ? block_size & 0xff : 0);
+
+	if (pred_table) {
+		memcpy(bytes + p, pred_table, num_blocks);
+		p += num_blocks;
+		QOI_FREE(pred_table);
+	}
+
+	memcpy(bytes + p, payload, payload_len);
+	p += payload_len;
+	QOI_FREE(payload);
+
+	*out_len = p;
+	return bytes;
+}
+
+void *qoi_encode_predictive(const void *data, const qoi_desc *desc,
+	int predictor, int *out_len)
+{
+	return qoi_predictive_encode(
+		data, desc, QOI_P_MODE_FIXED, predictor, 0, out_len);
+}
+
+void *qoi_encode_adaptive(const void *data, const qoi_desc *desc,
+	int block_size, int *out_len)
+{
+	return qoi_predictive_encode(
+		data, desc, QOI_P_MODE_ADAPTIVE, 0, block_size, out_len);
+}
+
+void *qoi_decode_predictive(const void *data, int size, qoi_desc *desc,
+	int channels)
+{
+	const unsigned char *bytes;
+	const unsigned char *pred_table;
+	unsigned char *residuals, *pixels;
+	unsigned int magic;
+	qoi_desc residual_desc;
+	int width, height, ch, blocks_x, blocks_y, num_blocks;
+	int mode, predictor, block_size;
+	int p, x, y, c;
+
+	if (
+		data == NULL || desc == NULL ||
+		(channels != 0 && channels != 3 && channels != 4) ||
+		size < QOI_P_HEADER_SIZE + QOI_HEADER_SIZE + (int)sizeof(qoi_padding)
+	) {
+		return NULL;
+	}
+
+	bytes = (const unsigned char *)data;
+
+	p = 0;
+	magic = qoi_read_32(bytes, &p);
+	desc->width = qoi_read_32(bytes, &p);
+	desc->height = qoi_read_32(bytes, &p);
+	desc->channels = bytes[p++];
+	desc->colorspace = bytes[p++];
+	mode = bytes[p++];
+	predictor = bytes[p++];
+	block_size = (bytes[p] << 8) | bytes[p + 1];
+	p += 2;
+
+	if (
+		magic != QOI_P_MAGIC ||
+		desc->width == 0 || desc->height == 0 ||
+		desc->channels < 3 || desc->channels > 4 ||
+		desc->colorspace > 1 ||
+		desc->height >= QOI_PIXELS_MAX / desc->width ||
+		(mode != QOI_P_MODE_FIXED && mode != QOI_P_MODE_ADAPTIVE) ||
+		(mode == QOI_P_MODE_FIXED &&
+			(predictor >= QOI_PREDICTOR_COUNT || block_size != 0)) ||
+		(mode == QOI_P_MODE_ADAPTIVE &&
+			(block_size < 1 || block_size > QOI_MAX_BLOCK_SIZE))
+	) {
+		return NULL;
+	}
+
+	width = (int)desc->width;
+	height = (int)desc->height;
+	ch = desc->channels;
+	blocks_x = 0;
+	blocks_y = 0;
+	num_blocks = 0;
+	pred_table = NULL;
+
+	if (mode == QOI_P_MODE_ADAPTIVE) {
+		int i;
+
+		blocks_x = (width + block_size - 1) / block_size;
+		blocks_y = (height + block_size - 1) / block_size;
+		num_blocks = blocks_x * blocks_y;
+
+		if (size < QOI_P_HEADER_SIZE + num_blocks +
+				QOI_HEADER_SIZE + (int)sizeof(qoi_padding)) {
+			return NULL;
+		}
+
+		pred_table = bytes + p;
+		for (i = 0; i < num_blocks; i++) {
+			if (pred_table[i] >= QOI_PREDICTOR_COUNT) {
+				return NULL;
+			}
+		}
+		p += num_blocks;
+	}
+
+	residual_desc = *desc;
+	residuals = (unsigned char *)
+		qoi_decode(bytes + p, size - p, &residual_desc, ch);
+	if (
+		!residuals ||
+		residual_desc.width != desc->width ||
+		residual_desc.height != desc->height ||
+		residual_desc.channels != desc->channels
+	) {
+		if (residuals) {
+			QOI_FREE(residuals);
+		}
+		return NULL;
+	}
+
+	pixels = (unsigned char *) QOI_MALLOC((size_t)width * height * ch);
+	if (!pixels) {
+		QOI_FREE(residuals);
+		return NULL;
+	}
+
+	/* Reconstruct the pixels in raster order so that the left, upper and
+	upper left neighbors of every pixel are already reconstructed. */
+	for (y = 0; y < height; y++) {
+		for (x = 0; x < width; x++) {
+			int pred_id = pred_table
+				? pred_table[(y / block_size) * blocks_x + x / block_size]
+				: predictor;
+			for (c = 0; c < ch; c++) {
+				int i = (y * width + x) * ch + c;
+				pixels[i] = (unsigned char)(residuals[i] +
+					qoi_predict_sample(pixels, width, ch, x, y, c,
+						pred_id));
+			}
+		}
+	}
+
+	QOI_FREE(residuals);
+
+	if (channels != 0 && channels != ch) {
+		unsigned char *converted = (unsigned char *)
+			QOI_MALLOC((size_t)width * height * channels);
+		int px_count = width * height;
+		int i;
+
+		if (!converted) {
+			QOI_FREE(pixels);
+			return NULL;
+		}
+
+		for (i = 0; i < px_count; i++) {
+			converted[i * channels + 0] = pixels[i * ch + 0];
+			converted[i * channels + 1] = pixels[i * ch + 1];
+			converted[i * channels + 2] = pixels[i * ch + 2];
+			if (channels == 4) {
+				converted[i * channels + 3] =
+					ch == 4 ? pixels[i * ch + 3] : 255;
+			}
+		}
+
+		QOI_FREE(pixels);
+		pixels = converted;
 	}
 
 	return pixels;
