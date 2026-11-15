@@ -289,6 +289,47 @@ The returned pixel data should be free()d after use. */
 void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels);
 
 
+/* Chroma subsampling modes for qoi_encode_subsampled() and
+qoi_decode_subsampled(). The luma (Y) and alpha (A) channels are always kept
+at full resolution; only the two chrominance (Cb/Cr) planes are reduced.
+	QOI_SAMPLING_444 - no chroma subsampling; the output is byte identical to
+	                   what qoi_encode()/qoi_decode() produce
+	QOI_SAMPLING_422 - chrominance planes at half the horizontal resolution
+	QOI_SAMPLING_420 - chrominance planes at half the horizontal and half the
+	                   vertical resolution
+Any other value makes the encode/decode functions fail and return NULL. */
+
+#define QOI_SAMPLING_444 0
+#define QOI_SAMPLING_422 1
+#define QOI_SAMPLING_420 2
+
+
+/* Encode raw RGB or RGBA pixels into a QOI image with chroma subsampling.
+The pixels are converted to YCbCr and the chrominance planes are reduced in
+resolution according to sampling before they are encoded. An existing alpha
+channel stays at full resolution.
+
+With QOI_SAMPLING_444 the result is identical to qoi_encode(). With 422 or
+420 a private container is produced that can only be read back with
+qoi_decode_subsampled(). Returns NULL on failure (invalid parameters or malloc
+failure) or a pointer to the encoded data, with out_len set to the size in
+bytes. The returned data should be free()d after use. */
+
+void *qoi_encode_subsampled(const void *data, const qoi_desc *desc, int sampling, int *out_len);
+
+
+/* Decode an image produced by qoi_encode_subsampled(). The subsampled
+chrominance planes are upsampled with nearest-neighbor reconstruction and the
+image is converted back to RGB or RGBA. The qoi_desc struct is filled with the
+original width, height, number of channels and colorspace.
+
+Plain QOI images (magic "qoif") are accepted as well and decoded with
+qoi_decode(). Returns NULL on failure or a pointer to the decoded pixels,
+which should be free()d after use. */
+
+void *qoi_decode_subsampled(const void *data, int size, qoi_desc *desc, int channels);
+
+
 #ifdef __cplusplus
 }
 #endif
@@ -587,6 +628,380 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 	}
 
 	return pixels;
+}
+
+/* -----------------------------------------------------------------------------
+Chroma subsampled en-/decoding (YCbCr, 4:4:4 / 4:2:2 / 4:2:0)
+
+For 422/420 a private "qois" container is used. It holds a 23 byte header
+followed by two independently encoded, standard QOI streams:
+ - a full resolution luma plane (Y,Y,Y,A; A only for RGBA input)
+ - a chrominance plane at the subsampled resolution (Cb,Cr,0)
+The chrominance planes are reduced with point sampling and reconstructed with
+nearest-neighbor upsampling. 4:4:4 has no subsampling at all and simply uses
+the regular QOI stream, staying byte identical to the original path. */
+
+#define QOI_SS_MAGIC \
+	(((unsigned int)'q') << 24 | ((unsigned int)'o') << 16 | \
+	 ((unsigned int)'i') <<  8 | ((unsigned int)'s'))
+#define QOI_SS_HEADER_SIZE 23
+#define QOI_SS_FIX 65536
+
+static unsigned char qoi_ss_clamp(int v) {
+	if (v < 0) {
+		return 0;
+	}
+	if (v > 255) {
+		return 255;
+	}
+	return (unsigned char)v;
+}
+
+/* Round towards nearest, ties away from zero, so the result is identical on
+platforms where integer division truncates towards zero. */
+static int qoi_ss_round_div(int v, int d) {
+	if (v >= 0) {
+		return (v + d / 2) / d;
+	}
+	return -((-v + d / 2) / d);
+}
+
+/* BT.601 full-range RGB <-> YCbCr with 16.16 fixed point coefficients. */
+static void qoi_ss_rgb_to_ycbcr(unsigned char r, unsigned char g, unsigned char b,
+	unsigned char *out_y, unsigned char *out_cb, unsigned char *out_cr)
+{
+	int y  = ( 19595 * r + 38470 * g +  7471 * b) / QOI_SS_FIX;
+	int cb = 128 + qoi_ss_round_div(-11059 * r - 21709 * g + 32768 * b, QOI_SS_FIX);
+	int cr = 128 + qoi_ss_round_div( 32768 * r - 27439 * g -  5329 * b, QOI_SS_FIX);
+	*out_y  = qoi_ss_clamp(y);
+	*out_cb = qoi_ss_clamp(cb);
+	*out_cr = qoi_ss_clamp(cr);
+}
+
+static void qoi_ss_ycbcr_to_rgb(unsigned char y, unsigned char cb, unsigned char cr,
+	unsigned char *out_r, unsigned char *out_g, unsigned char *out_b)
+{
+	int fy = y;
+	int dcb = (int)cb - 128;
+	int dcr = (int)cr - 128;
+	int r = fy + qoi_ss_round_div( 91881 * dcr, QOI_SS_FIX);
+	int g = fy - qoi_ss_round_div( 22554 * dcb + 46802 * dcr, QOI_SS_FIX);
+	int b = fy + qoi_ss_round_div(116130 * dcb, QOI_SS_FIX);
+	*out_r = qoi_ss_clamp(r);
+	*out_g = qoi_ss_clamp(g);
+	*out_b = qoi_ss_clamp(b);
+}
+
+/* Validate the header of an embedded QOI stream without allocating anything.
+Besides the regular header checks this bounds the declared pixel count by the
+number of bytes available, so a corrupted inner header cannot make the decoder
+reserve an arbitrarily large buffer. */
+static int qoi_ss_inner_header_ok(const unsigned char *stream, int len,
+	unsigned int max_pixels)
+{
+	unsigned int magic, width, height, usable;
+	unsigned char ch, colorspace;
+
+	if (len < QOI_HEADER_SIZE + (int)sizeof(qoi_padding)) {
+		return 0;
+	}
+	magic = ((unsigned int)stream[0] << 24) | ((unsigned int)stream[1] << 16) |
+		((unsigned int)stream[2] << 8) | (unsigned int)stream[3];
+	width = ((unsigned int)stream[4] << 24) | ((unsigned int)stream[5] << 16) |
+		((unsigned int)stream[6] << 8) | (unsigned int)stream[7];
+	height = ((unsigned int)stream[8] << 24) | ((unsigned int)stream[9] << 16) |
+		((unsigned int)stream[10] << 8) | (unsigned int)stream[11];
+	ch = stream[12];
+	colorspace = stream[13];
+
+	if (
+		magic != QOI_MAGIC || width == 0 || height == 0 ||
+		ch < 3 || ch > 4 || colorspace > 1 ||
+		height >= QOI_PIXELS_MAX / width
+	) {
+		return 0;
+	}
+
+	usable = (unsigned int)len - QOI_HEADER_SIZE - (unsigned int)sizeof(qoi_padding);
+	if (width > usable / (unsigned int)(ch + 1)) {
+		return 0;
+	}
+	if (height > max_pixels / width) {
+		return 0;
+	}
+	return 1;
+}
+
+void *qoi_encode_subsampled(const void *data, const qoi_desc *desc, int sampling, int *out_len) {
+	const unsigned char *pixels;
+	unsigned char *y_plane, *c_plane, *y_bytes, *c_bytes, *out;
+	qoi_desc y_desc, c_desc;
+	int channels, total, y_len, c_len, cw, ch;
+	int i, count, pi, ci;
+
+	if (
+		data == NULL || out_len == NULL || desc == NULL ||
+		desc->width == 0 || desc->height == 0 ||
+		desc->channels < 3 || desc->channels > 4 ||
+		desc->colorspace > 1 ||
+		desc->height >= QOI_PIXELS_MAX / desc->width
+	) {
+		return NULL;
+	}
+
+	if (sampling == QOI_SAMPLING_444) {
+		return qoi_encode(data, desc, out_len);
+	}
+	if (sampling != QOI_SAMPLING_422 && sampling != QOI_SAMPLING_420) {
+		return NULL;
+	}
+
+	channels = desc->channels;
+	count = (int)desc->width * (int)desc->height;
+	cw = ((int)desc->width + 1) / 2;
+	ch = (sampling == QOI_SAMPLING_420)
+		? ((int)desc->height + 1) / 2
+		: (int)desc->height;
+
+	/* Guard against overflow before any allocation. */
+	if (count < 0 || cw < 0 || ch < 0 ||
+		(unsigned int)count >= QOI_PIXELS_MAX ||
+		(unsigned int)cw * (unsigned int)ch >= QOI_PIXELS_MAX
+	) {
+		return NULL;
+	}
+
+	y_plane = (unsigned char *)QOI_MALLOC((size_t)count * channels);
+	c_plane = (unsigned char *)QOI_MALLOC((size_t)cw * ch * 3);
+	if (!y_plane || !c_plane) {
+		QOI_FREE(y_plane);
+		QOI_FREE(c_plane);
+		return NULL;
+	}
+
+	pixels = (const unsigned char *)data;
+
+	for (i = 0; i < count; i++) {
+		unsigned char yv, cb, cr;
+		pi = i * channels;
+		qoi_ss_rgb_to_ycbcr(pixels[pi], pixels[pi + 1], pixels[pi + 2], &yv, &cb, &cr);
+		y_plane[pi] = yv;
+		y_plane[pi + 1] = yv;
+		y_plane[pi + 2] = yv;
+		if (channels == 4) {
+			y_plane[pi + 3] = pixels[pi + 3];
+		}
+	}
+
+	/* Point-sample the chrominance planes: keep the top-left pixel of each
+	block. Odd widths/heights duplicate the last row/column sample. */
+	for (i = 0; i < cw * ch; i++) {
+		int cx = i % cw;
+		int cy = i / cw;
+		int sx = cx * 2;
+		int sy = cy * (sampling == QOI_SAMPLING_420 ? 2 : 1);
+		unsigned char cb, cr, yv;
+		pi = (sy * (int)desc->width + sx) * channels;
+		ci = i * 3;
+		qoi_ss_rgb_to_ycbcr(pixels[pi], pixels[pi + 1], pixels[pi + 2], &yv, &cb, &cr);
+		(void)yv;
+		c_plane[ci] = cb;
+		c_plane[ci + 1] = cr;
+		c_plane[ci + 2] = 0;
+	}
+
+	y_desc = *desc;
+	y_desc.channels = (unsigned char)channels;
+	y_desc.width = desc->width;
+	y_desc.height = desc->height;
+
+	c_desc.width = (unsigned int)cw;
+	c_desc.height = (unsigned int)ch;
+	c_desc.channels = 3;
+	c_desc.colorspace = desc->colorspace;
+
+	y_bytes = (unsigned char *)qoi_encode(y_plane, &y_desc, &y_len);
+	c_bytes = (unsigned char *)qoi_encode(c_plane, &c_desc, &c_len);
+	QOI_FREE(y_plane);
+	QOI_FREE(c_plane);
+	if (!y_bytes || !c_bytes) {
+		QOI_FREE(y_bytes);
+		QOI_FREE(c_bytes);
+		return NULL;
+	}
+
+	if (y_len < 0 || c_len < 0 ||
+		(size_t)QOI_SS_HEADER_SIZE + (size_t)y_len > (size_t)0x7fffffff - (size_t)c_len
+	) {
+		QOI_FREE(y_bytes);
+		QOI_FREE(c_bytes);
+		return NULL;
+	}
+	total = QOI_SS_HEADER_SIZE + y_len + c_len;
+
+	out = (unsigned char *)QOI_MALLOC((size_t)total);
+	if (!out) {
+		QOI_FREE(y_bytes);
+		QOI_FREE(c_bytes);
+		return NULL;
+	}
+
+	{
+		int p = 0;
+		qoi_write_32(out, &p, QOI_SS_MAGIC);
+		qoi_write_32(out, &p, desc->width);
+		qoi_write_32(out, &p, desc->height);
+		out[p++] = (unsigned char)channels;
+		out[p++] = desc->colorspace;
+		out[p++] = (unsigned char)sampling;
+		qoi_write_32(out, &p, (unsigned int)y_len);
+		qoi_write_32(out, &p, (unsigned int)c_len);
+		memcpy(out + p, y_bytes, (size_t)y_len);
+		p += y_len;
+		memcpy(out + p, c_bytes, (size_t)c_len);
+	}
+
+	QOI_FREE(y_bytes);
+	QOI_FREE(c_bytes);
+	*out_len = total;
+	return out;
+}
+
+void *qoi_decode_subsampled(const void *data, int size, qoi_desc *desc, int channels) {
+	const unsigned char *bytes;
+	unsigned char *y_decoded, *c_decoded, *out;
+	qoi_desc y_desc, c_desc;
+	unsigned int header_magic;
+	int p = 0, sampling, out_channels, cw, ch, i;
+	int y_len, c_len, count;
+
+	if (
+		data == NULL || desc == NULL ||
+		(channels != 0 && channels != 3 && channels != 4) ||
+		size < QOI_SS_HEADER_SIZE
+	) {
+		return NULL;
+	}
+
+	bytes = (const unsigned char *)data;
+	header_magic = qoi_read_32(bytes, &p);
+
+	/* Plain QOI streams use the original decoder unchanged. */
+	if (header_magic == QOI_MAGIC) {
+		return qoi_decode(data, size, desc, channels);
+	}
+	if (header_magic != QOI_SS_MAGIC) {
+		return NULL;
+	}
+
+	desc->width = qoi_read_32(bytes, &p);
+	desc->height = qoi_read_32(bytes, &p);
+	desc->channels = bytes[p++];
+	desc->colorspace = bytes[p++];
+	sampling = bytes[p++];
+	y_len = (int)qoi_read_32(bytes, &p);
+	c_len = (int)qoi_read_32(bytes, &p);
+
+	if (
+		desc->width == 0 || desc->height == 0 ||
+		desc->channels < 3 || desc->channels > 4 ||
+		desc->colorspace > 1 ||
+		desc->height >= QOI_PIXELS_MAX / desc->width ||
+		(sampling != QOI_SAMPLING_422 && sampling != QOI_SAMPLING_420) ||
+		y_len <= 0 || c_len <= 0 ||
+		y_len > size - QOI_SS_HEADER_SIZE ||
+		c_len > size - QOI_SS_HEADER_SIZE - y_len
+	) {
+		return NULL;
+	}
+
+	/* A QOI stream needs its 14 byte header plus the 8 byte end marker and
+	uses at most 5 bytes per pixel, so a stream shorter than the payload
+	described by the container header can never be valid. Rejecting this up
+	front also keeps malformed containers from triggering huge allocations. */
+	if (
+		(unsigned int)y_len < QOI_HEADER_SIZE + (int)sizeof(qoi_padding) ||
+		(unsigned int)c_len < QOI_HEADER_SIZE + (int)sizeof(qoi_padding) ||
+		desc->width >
+			(unsigned int)((y_len - QOI_HEADER_SIZE - (int)sizeof(qoi_padding)) / 5) ||
+		desc->height >
+			(unsigned int)((y_len - QOI_HEADER_SIZE - (int)sizeof(qoi_padding)) / 5)
+	) {
+		return NULL;
+	}
+
+	out_channels = (channels == 0) ? (int)desc->channels : channels;
+
+	if (
+		!qoi_ss_inner_header_ok(bytes + p, y_len, desc->width * desc->height) ||
+		!qoi_ss_inner_header_ok(bytes + p + y_len, c_len, QOI_PIXELS_MAX)
+	) {
+		return NULL;
+	}
+
+	y_decoded = (unsigned char *)qoi_decode(bytes + p, y_len, &y_desc, (int)desc->channels);
+	c_decoded = (unsigned char *)qoi_decode(bytes + p + y_len, c_len, &c_desc, 3);
+	if (!y_decoded || !c_decoded) {
+		QOI_FREE(y_decoded);
+		QOI_FREE(c_decoded);
+		return NULL;
+	}
+
+	if (
+		y_desc.width != desc->width || y_desc.height != desc->height ||
+		y_desc.channels != desc->channels
+	) {
+		QOI_FREE(y_decoded);
+		QOI_FREE(c_decoded);
+		return NULL;
+	}
+
+	cw = ((int)desc->width + 1) / 2;
+	ch = (sampling == QOI_SAMPLING_420)
+		? ((int)desc->height + 1) / 2
+		: (int)desc->height;
+	if (c_desc.width != (unsigned int)cw || c_desc.height != (unsigned int)ch) {
+		QOI_FREE(y_decoded);
+		QOI_FREE(c_decoded);
+		return NULL;
+	}
+
+	count = (int)desc->width * (int)desc->height;
+	if (count < 0 || (unsigned int)count >= QOI_PIXELS_MAX) {
+		QOI_FREE(y_decoded);
+		QOI_FREE(c_decoded);
+		return NULL;
+	}
+
+	out = (unsigned char *)QOI_MALLOC((size_t)count * (size_t)out_channels);
+	if (!out) {
+		QOI_FREE(y_decoded);
+		QOI_FREE(c_decoded);
+		return NULL;
+	}
+
+	/* Nearest-neighbor reconstruct the chrominance planes and convert back. */
+	for (i = 0; i < count; i++) {
+		int x = i % (int)desc->width;
+		int y = i / (int)desc->width;
+		int sx = x / 2;
+		int sy = y / (sampling == QOI_SAMPLING_420 ? 2 : 1);
+		int ci = (sy * cw + sx) * 3;
+		int yi = i * (int)desc->channels;
+		int oi = i * out_channels;
+		unsigned char r, g, b;
+		qoi_ss_ycbcr_to_rgb(y_decoded[yi], c_decoded[ci], c_decoded[ci + 1], &r, &g, &b);
+		out[oi] = r;
+		out[oi + 1] = g;
+		out[oi + 2] = b;
+		if (out_channels == 4) {
+			out[oi + 3] = (desc->channels == 4) ? y_decoded[yi + 3] : 255;
+		}
+	}
+
+	QOI_FREE(y_decoded);
+	QOI_FREE(c_decoded);
+	return out;
 }
 
 #ifndef QOI_NO_STDIO
