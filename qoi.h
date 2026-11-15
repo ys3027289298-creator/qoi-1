@@ -68,7 +68,8 @@ struct qoi_header_t {
 	uint32_t width;      // image width in pixels (BE)
 	uint32_t height;     // image height in pixels (BE)
 	uint8_t  channels;   // 3 = RGB, 4 = RGBA
-	uint8_t  colorspace; // 0 = sRGB with linear alpha, 1 = all channels linear
+	uint8_t  colorspace; // bit 0: 0 = sRGB with linear alpha, 1 = all channels linear
+	                     // bit 1: horizontal mirror flag, bit 2: vertical mirror flag
 };
 
 Images are encoded row by row, left to right, top to bottom. The decoder and
@@ -233,6 +234,20 @@ how chunks are en-/decoded. */
 #define QOI_SRGB   0
 #define QOI_LINEAR 1
 
+/* The colorspace byte of the file header may additionally carry mirror flags
+in its upper bits. When encoding with QOI_MIRROR_HORIZONTAL and/or
+QOI_MIRROR_VERTICAL set in desc->colorspace (OR'd with QOI_SRGB/QOI_LINEAR),
+the pixels are mirrored before encoding and the flags are stored in the file
+header. qoi_decode/qoi_read then automatically mirror the decoded pixels back,
+so a mirrored encode followed by a decode restores the original pixels
+exactly. Mirroring twice with the same flag restores the original pixels
+bit-exactly. Any other bits set in the colorspace byte are invalid and make
+qoi_encode/qoi_decode fail. */
+
+#define QOI_MIRROR_HORIZONTAL 0x02
+#define QOI_MIRROR_VERTICAL   0x04
+#define QOI_MIRROR_MASK       0x06
+
 typedef struct {
 	unsigned int width;
 	unsigned int height;
@@ -338,6 +353,39 @@ typedef union {
 
 static const unsigned char qoi_padding[8] = {0,0,0,0,0,0,0,1};
 
+/* Mirror a pixel buffer in place. Each of the horizontal and vertical mirror
+is its own inverse, so applying the same flags twice restores the original
+pixels exactly. */
+static void qoi_mirror_inplace(unsigned char *pixels, int w, int h, int channels, int flags) {
+	int x, y, c;
+	int stride = w * channels;
+
+	if (flags & QOI_MIRROR_HORIZONTAL) {
+		for (y = 0; y < h; y++) {
+			unsigned char *row = pixels + y * stride;
+			for (x = 0; x < w / 2; x++) {
+				for (c = 0; c < channels; c++) {
+					unsigned char t = row[x * channels + c];
+					row[x * channels + c] = row[(w - 1 - x) * channels + c];
+					row[(w - 1 - x) * channels + c] = t;
+				}
+			}
+		}
+	}
+
+	if (flags & QOI_MIRROR_VERTICAL) {
+		for (y = 0; y < h / 2; y++) {
+			unsigned char *row_a = pixels + y * stride;
+			unsigned char *row_b = pixels + (h - 1 - y) * stride;
+			for (x = 0; x < stride; x++) {
+				unsigned char t = row_a[x];
+				row_a[x] = row_b[x];
+				row_b[x] = t;
+			}
+		}
+	}
+}
+
 static void qoi_write_32(unsigned char *bytes, int *p, unsigned int v) {
 	bytes[(*p)++] = (0xff000000 & v) >> 24;
 	bytes[(*p)++] = (0x00ff0000 & v) >> 16;
@@ -356,7 +404,7 @@ static unsigned int qoi_read_32(const unsigned char *bytes, int *p) {
 void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	int i, max_size, p, run;
 	int px_len, px_end, px_pos, channels;
-	unsigned char *bytes;
+	unsigned char *bytes, *mirrored;
 	const unsigned char *pixels;
 	qoi_rgba_t index[64];
 	qoi_rgba_t px, px_prev;
@@ -365,7 +413,7 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 		data == NULL || out_len == NULL || desc == NULL ||
 		desc->width == 0 || desc->height == 0 ||
 		desc->channels < 3 || desc->channels > 4 ||
-		desc->colorspace > 1 ||
+		(desc->colorspace & ~(QOI_MIRROR_MASK | 1)) != 0 ||
 		desc->height >= QOI_PIXELS_MAX / desc->width
 	) {
 		return NULL;
@@ -390,6 +438,8 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 
 	pixels = (const unsigned char *)data;
 
+	mirrored = NULL;
+
 	QOI_ZEROARR(index);
 
 	run = 0;
@@ -402,6 +452,18 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	px_len = desc->width * desc->height * desc->channels;
 	px_end = px_len - desc->channels;
 	channels = desc->channels;
+
+	if (desc->colorspace & QOI_MIRROR_MASK) {
+		mirrored = (unsigned char *) QOI_MALLOC(px_len);
+		if (!mirrored) {
+			QOI_FREE(bytes);
+			return NULL;
+		}
+		memcpy(mirrored, data, px_len);
+		qoi_mirror_inplace(mirrored, desc->width, desc->height, channels,
+			desc->colorspace & QOI_MIRROR_MASK);
+		pixels = mirrored;
+	}
 
 	for (px_pos = 0; px_pos < px_len; px_pos += channels) {
 		px.rgba.r = pixels[px_pos + 0];
@@ -481,6 +543,10 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 		bytes[p++] = qoi_padding[i];
 	}
 
+	if (mirrored) {
+		QOI_FREE(mirrored);
+	}
+
 	*out_len = p;
 	return bytes;
 }
@@ -513,7 +579,7 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 	if (
 		desc->width == 0 || desc->height == 0 ||
 		desc->channels < 3 || desc->channels > 4 ||
-		desc->colorspace > 1 ||
+		(desc->colorspace & ~(QOI_MIRROR_MASK | 1)) != 0 ||
 		header_magic != QOI_MAGIC ||
 		desc->height >= QOI_PIXELS_MAX / desc->width
 	) {
@@ -584,6 +650,11 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 		if (channels == 4) {
 			pixels[px_pos + 3] = px.rgba.a;
 		}
+	}
+
+	if (desc->colorspace & QOI_MIRROR_MASK) {
+		qoi_mirror_inplace(pixels, desc->width, desc->height, channels,
+			desc->colorspace & QOI_MIRROR_MASK);
 	}
 
 	return pixels;
