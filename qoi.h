@@ -278,6 +278,40 @@ The returned qoi data should be free()d after use. */
 void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len);
 
 
+/* Status codes returned by qoi_encode_crop() through its out_status argument.
+The low nibble describes the general outcome; the upper bits of a success
+code flag which crop rectangle edges were clamped to the image bounds. */
+
+#define QOI_CROP_OK          0x00
+#define QOI_CROP_ERR_PARAM   0x01
+#define QOI_CROP_ERR_EMPTY   0x02
+#define QOI_CROP_ERR_NOMEM   0x03
+
+#define QOI_CROP_CLIP_X      0x10 /* left or right edge was clamped        */
+#define QOI_CROP_CLIP_Y      0x20 /* top or bottom edge was clamped         */
+#define QOI_CROP_CLIP_MASK   0x30
+
+
+/* Encode only a rectangular crop of the raw RGB/RGBA pixels into a QOI image
+in memory. The rectangle is given as x, y (top left corner) and crop_w,
+crop_h in pixels. Pixels outside the rectangle never enter the encoded
+file; on success the decoded image is exactly the cropped region.
+
+Coordinates and extents that fall outside the image are clamped to the image
+bounds; qoi_encode_crop() reports any clamping in *out_status via the
+QOI_CROP_CLIP_* flags. A rectangle that does not cover any pixel (zero or
+negative extent, or fully outside the image) is rejected with
+QOI_CROP_ERR_EMPTY.
+
+The function either returns NULL on failure and sets *out_status to one of
+the QOI_CROP_ERR_* codes, or returns a pointer to the encoded data on
+success with *out_len set to the size in bytes of the encoded data. The
+returned qoi data should be free()d after use. */
+
+void *qoi_encode_crop(const void *data, const qoi_desc *desc, int x, int y,
+	int crop_w, int crop_h, int *out_len, int *out_status);
+
+
 /* Decode a QOI image from memory.
 
 The function either returns NULL on failure (invalid parameters or malloc
@@ -483,6 +517,102 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 
 	*out_len = p;
 	return bytes;
+}
+
+void *qoi_encode_crop(const void *data, const qoi_desc *desc, int x, int y,
+	int crop_w, int crop_h, int *out_len, int *out_status) {
+	int x0, y0, x1, y1, clip, channels, row;
+	int crop_width, crop_height, crop_bytes, row_bytes;
+	unsigned char *crop_pixels, *encoded;
+	const unsigned char *pixels;
+	qoi_desc crop_desc;
+
+	if (
+		data == NULL || out_len == NULL || desc == NULL ||
+		desc->width == 0 || desc->height == 0 ||
+		desc->channels < 3 || desc->channels > 4 ||
+		desc->colorspace > 1 ||
+		desc->height >= QOI_PIXELS_MAX / desc->width
+	) {
+		if (out_status) {
+			*out_status = QOI_CROP_ERR_PARAM;
+		}
+		return NULL;
+	}
+
+	/* Clamp the requested rectangle to the image bounds. The end coordinates
+	are computed in long long so x + crop_w can never overflow int. */
+	{
+		long long req_x1 = (long long)x + crop_w;
+		long long req_y1 = (long long)y + crop_h;
+
+		x0 = (x < 0) ? 0 : x;
+		y0 = (y < 0) ? 0 : y;
+		x1 = (req_x1 > (long long)desc->width) ? (int)desc->width : (int)req_x1;
+		y1 = (req_y1 > (long long)desc->height) ? (int)desc->height : (int)req_y1;
+		if (x1 < 0) { x1 = 0; }
+		if (y1 < 0) { y1 = 0; }
+
+		clip = QOI_CROP_OK;
+		if (x < 0 || req_x1 > (long long)desc->width) {
+			clip |= QOI_CROP_CLIP_X;
+		}
+		if (y < 0 || req_y1 > (long long)desc->height) {
+			clip |= QOI_CROP_CLIP_Y;
+		}
+	}
+
+	/* A rectangle covering no pixels is an error, not an empty image. */
+	if (x1 <= x0 || y1 <= y0) {
+		if (out_status) {
+			*out_status = QOI_CROP_ERR_EMPTY;
+		}
+		return NULL;
+	}
+
+	crop_width = x1 - x0;
+	crop_height = y1 - y0;
+	channels = desc->channels;
+	row_bytes = crop_width * channels;
+	crop_bytes = crop_height * row_bytes;
+
+	crop_pixels = (unsigned char *) QOI_MALLOC((size_t)crop_bytes);
+	if (!crop_pixels) {
+		if (out_status) {
+			*out_status = QOI_CROP_ERR_NOMEM;
+		}
+		return NULL;
+	}
+
+	/* Gather only the pixels inside the clamped rectangle; everything
+	outside it is left untouched and never reaches the encoder. */
+	pixels = (const unsigned char *)data;
+	for (row = 0; row < crop_height; row++) {
+		const unsigned char *src = pixels +
+			(((size_t)(y0 + row) * desc->width) + x0) * channels;
+		memcpy(crop_pixels + (size_t)row * row_bytes, src, (size_t)row_bytes);
+	}
+
+	crop_desc.width = (unsigned int)crop_width;
+	crop_desc.height = (unsigned int)crop_height;
+	crop_desc.channels = desc->channels;
+	crop_desc.colorspace = desc->colorspace;
+
+	encoded = (unsigned char *) qoi_encode(crop_pixels, &crop_desc, out_len);
+
+	QOI_FREE(crop_pixels);
+
+	if (!encoded) {
+		if (out_status) {
+			*out_status = QOI_CROP_ERR_NOMEM;
+		}
+		return NULL;
+	}
+
+	if (out_status) {
+		*out_status = QOI_CROP_OK | clip;
+	}
+	return encoded;
 }
 
 void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
