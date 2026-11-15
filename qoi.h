@@ -289,6 +289,110 @@ The returned pixel data should be free()d after use. */
 void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels);
 
 
+/* -----------------------------------------------------------------------------
+QOAF - QOI Animation Frame container
+
+An indexed container for sequences of independently encoded QOI images. Each
+frame is encoded with the unchanged qoi_encode() function, so a frame pulled
+out of a container is byte-identical to the same image encoded standalone.
+
+On-disk layout (all multi-byte values are big endian):
+
+	struct qoaf_header_t {        // all offsets shown in brackets
+		char     magic[4];       // [ 0] "qoaf"
+		uint32_t version;        // [ 4] 1
+		uint32_t frame_count;    // [ 8] number of frames, 0 is rejected
+		uint32_t width;          // [12] image width shared by all frames
+		uint32_t height;         // [16] image height shared by all frames
+		uint8_t  channels;       // [20] 3 = RGB, 4 = RGBA
+		uint8_t  colorspace;     // [21] 0 = sRGB, 1 = linear
+		uint16_t flags;          // [22] reserved, must be 0
+		uint32_t table_crc;      // [24] FNV-1a 32 bit checksum of the
+		                         //      index table that follows this header
+	};                             // 28 bytes
+
+	struct qoaf_entry_t {          // one entry per frame, frame_count total
+		uint32_t offset;       // offset of the frame's "qoif" data
+		uint32_t size;         // size of the frame's QOI data in bytes
+		uint16_t delay_ms;     // frame delay in milliseconds (configurable)
+		uint16_t flags;        // bit 0 = keyframe (configurable)
+	};                             // 12 bytes per frame
+
+	<frame_count * qoaf_entry_t>   // the index (offset) table
+	<frame 0 QOI data><frame 1 QOI data>...  // tightly packed frame data
+
+Frames are located purely through the offset table, which allows random access
+to any frame by index as well as sequential playback with the player API. */
+
+#define QOAF_MAGIC \
+	(((unsigned int)'q') << 24 | ((unsigned int)'o') << 16 | \
+	 ((unsigned int)'a') <<  8 | ((unsigned int)'f'))
+#define QOAF_VERSION 1
+#define QOAF_HEADER_SIZE 28
+#define QOAF_ENTRY_SIZE 12
+#define QOAF_FRAMES_MAX ((unsigned int)16000000)
+#define QOAF_FLAG_KEYFRAME 0x0001
+
+/* Per-frame, user configurable options. opts may be NULL in qoaf_encode(),
+in which case every frame gets delay_ms 0 and is marked as a keyframe. */
+typedef struct {
+	unsigned short delay_ms;
+	unsigned char keyframe;
+} qoaf_frame_opts;
+
+
+/* Encode frame_count images, described by descs[0..frame_count-1] and pixel
+buffers pixels[0..frame_count-1], into one indexed QOAF container in memory.
+All frames must share the same dimensions, channels and colorspace. Returns
+NULL on failure and sets *out_len to 0. The returned data is free()d by the
+caller. */
+void *qoaf_encode(const void *const *pixels, const qoi_desc *descs,
+	const qoaf_frame_opts *opts, int frame_count, int *out_len);
+
+
+/* Decode a single frame by index (0 <= index < frame_count). The returned
+pixels are free()d by the caller. Returns NULL on failure, including a frame
+count of 0 or a corrupted offset table. */
+void *qoaf_decode_frame(const void *data, int size, int index,
+	qoi_desc *desc, int channels, qoaf_frame_opts *opts);
+
+
+/* Decode every frame in order. *out_frames receives a malloc()d array of
+frame_count pixel pointers that the caller must free() individually before
+freeing the array itself. desc receives the shared frame description and
+out_descs, when non-NULL, receives a malloc()d array of per-frame options.
+Returns the number of decoded frames or 0 on failure. */
+int qoaf_decode_all(const void *data, int size, int channels,
+	void ***out_frames, qoi_desc *desc, qoaf_frame_opts **out_descs);
+
+
+/* Sequential player over a container. The player references the caller's
+buffer without copying it and supports random access through
+qoaf_player_seek(). */
+typedef struct qoaf_player qoaf_player;
+
+qoaf_player *qoaf_player_open(const void *data, int size);
+void qoaf_player_close(qoaf_player *player);
+int qoaf_player_seek(qoaf_player *player, int index);
+void *qoaf_player_next(qoaf_player *player, qoi_desc *desc, int channels,
+	qoaf_frame_opts *opts);
+int qoaf_player_index(const qoaf_player *player);
+int qoaf_player_count(const qoaf_player *player);
+
+
+#ifndef QOI_NO_STDIO
+
+/* Write an encoded QOAF container to the file system. Returns the number of
+bytes written or 0 on failure. */
+int qoaf_write(const char *filename, const void *data, int size);
+
+/* Read a complete QOAF container from the file system. *out_len receives the
+file size. The returned buffer is free()d by the caller. */
+void *qoaf_read(const char *filename, int *out_len);
+
+#endif /* QOI_NO_STDIO */
+
+
 #ifdef __cplusplus
 }
 #endif
@@ -589,6 +693,407 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 	return pixels;
 }
 
+
+/* -----------------------------------------------------------------------------
+QOAF - QOI Animation Frame container implementation */
+
+#define QOAF_MASK_KEYFRAME 0x0001u
+
+struct qoaf_player {
+	const unsigned char *data;
+	int size;
+	unsigned int frame_count;
+	int pos;
+};
+
+static unsigned int qoaf_crc32(const unsigned char *data, int len) {
+	unsigned int crc = 2166136261u;
+	int i;
+	for (i = 0; i < len; i++) {
+		crc ^= data[i];
+		crc *= 16777619u;
+	}
+	return crc;
+}
+
+/* Validate the container header and the offset table. Returns the number of
+frames or 0 when the data is not a valid QOAF container. */
+static unsigned int qoaf_validate(const void *data, int size) {
+	const unsigned char *bytes;
+	unsigned int magic, version, frame_count, width, height, table_crc, calc_crc;
+	unsigned int table_bytes, data_start, prev_end, i;
+	unsigned char channels, colorspace, flags_hi, flags_lo;
+	int p = 0;
+
+	if (data == NULL || size < QOAF_HEADER_SIZE) {
+		return 0;
+	}
+	bytes = (const unsigned char *)data;
+
+	magic = qoi_read_32(bytes, &p);
+	version = qoi_read_32(bytes, &p);
+	frame_count = qoi_read_32(bytes, &p);
+	/* width, height */
+	width = qoi_read_32(bytes, &p);
+	height = qoi_read_32(bytes, &p);
+	/* channels [20], colorspace [21], flags [22..23] */
+	channels = bytes[p++];
+	colorspace = bytes[p++];
+	flags_hi = bytes[p++];
+	flags_lo = bytes[p++];
+	/* table_crc [24..27] */
+	table_crc = qoi_read_32(bytes, &p);
+
+	if (
+		magic != QOAF_MAGIC || version != QOAF_VERSION ||
+		frame_count == 0 || frame_count > QOAF_FRAMES_MAX ||
+		width == 0 || height == 0 ||
+		channels < 3 || channels > 4 || colorspace > 1 ||
+		flags_hi != 0 || flags_lo != 0 ||
+		height >= QOI_PIXELS_MAX / width
+	) {
+		return 0;
+	}
+
+	if ((unsigned long long)frame_count * QOAF_ENTRY_SIZE > (unsigned int)-1) {
+		return 0;
+	}
+	table_bytes = frame_count * QOAF_ENTRY_SIZE;
+
+	if ((unsigned long long)size < (unsigned long long)QOAF_HEADER_SIZE + table_bytes) {
+		return 0;
+	}
+
+	calc_crc = qoaf_crc32(bytes + QOAF_HEADER_SIZE, (int)table_bytes);
+	if (calc_crc != table_crc) {
+		return 0;
+	}
+
+	data_start = QOAF_HEADER_SIZE + table_bytes;
+	prev_end = data_start;
+
+	for (i = 0; i < frame_count; i++) {
+		const unsigned char *entry = bytes + QOAF_HEADER_SIZE + i * QOAF_ENTRY_SIZE;
+		unsigned int offset, frame_size;
+		int ep = 0;
+
+		offset = qoi_read_32(entry, &ep);
+		frame_size = qoi_read_32(entry, &ep);
+
+		/* Entries must be tight, in order and fully inside the file. */
+		if (offset != prev_end || frame_size == 0) {
+			return 0;
+		}
+		if ((unsigned long long)offset + frame_size > (unsigned long long)size) {
+			return 0;
+		}
+		prev_end = offset + frame_size;
+	}
+
+	return frame_count;
+}
+
+static void *qoaf_decode_at(const void *data, int index,
+	qoi_desc *desc, int channels, qoaf_frame_opts *opts)
+{
+	const unsigned char *bytes = (const unsigned char *)data;
+	const unsigned char *entry;
+	unsigned int offset, frame_size;
+	int ep = 0, hp = 0;
+	void *pixels;
+
+	entry = bytes + QOAF_HEADER_SIZE + (unsigned int)index * QOAF_ENTRY_SIZE;
+	offset = qoi_read_32(entry, &ep);
+	frame_size = qoi_read_32(entry, &ep);
+
+	if (opts != NULL) {
+		opts->delay_ms = (unsigned short)(
+			((unsigned int)entry[8] << 8) | (unsigned int)entry[9]
+		);
+		opts->keyframe = (unsigned char)(
+			(((unsigned int)entry[10] << 8) | (unsigned int)entry[11]) &
+			QOAF_MASK_KEYFRAME
+		);
+	}
+
+	/* The frame itself must be a valid QOI image. */
+	if (
+		frame_size < QOI_HEADER_SIZE + (int)sizeof(qoi_padding) ||
+		qoi_read_32(bytes + offset, &hp) != QOI_MAGIC
+	) {
+		return NULL;
+	}
+
+	pixels = qoi_decode(bytes + offset, (int)frame_size, desc, channels);
+	return pixels;
+}
+
+void *qoaf_encode(const void *const *pixels, const qoi_desc *descs,
+	const qoaf_frame_opts *opts, int frame_count, int *out_len)
+{
+	unsigned char **frames;
+	int *frame_sizes;
+	unsigned char *bytes;
+	unsigned int table_bytes, data_start, total, table_crc;
+	int i, p;
+
+	if (out_len != NULL) {
+		*out_len = 0;
+	}
+
+	if (
+		pixels == NULL || descs == NULL || out_len == NULL ||
+		frame_count <= 0 || (unsigned int)frame_count > QOAF_FRAMES_MAX
+	) {
+		return NULL;
+	}
+
+	if (
+		descs[0].width == 0 || descs[0].height == 0 ||
+		descs[0].channels < 3 || descs[0].channels > 4 ||
+		descs[0].colorspace > 1 ||
+		descs[0].height >= QOI_PIXELS_MAX / descs[0].width
+	) {
+		return NULL;
+	}
+
+	table_bytes = (unsigned int)frame_count * QOAF_ENTRY_SIZE;
+	data_start = QOAF_HEADER_SIZE + table_bytes;
+
+	frames = (unsigned char **)QOI_MALLOC((size_t)frame_count * sizeof(void *));
+	frame_sizes = (int *)QOI_MALLOC((size_t)frame_count * sizeof(int));
+	if (frames == NULL || frame_sizes == NULL) {
+		QOI_FREE(frames);
+		QOI_FREE(frame_sizes);
+		return NULL;
+	}
+
+	total = data_start;
+
+	for (i = 0; i < frame_count; i++) {
+		if (
+			pixels[i] == NULL ||
+			descs[i].width != descs[0].width ||
+			descs[i].height != descs[0].height ||
+			descs[i].channels != descs[0].channels ||
+			descs[i].colorspace != descs[0].colorspace
+		) {
+			goto encode_fail;
+		}
+
+		frames[i] = (unsigned char *)qoi_encode(pixels[i], &descs[i], &frame_sizes[i]);
+		if (frames[i] == NULL || frame_sizes[i] <= 0) {
+			goto encode_fail;
+		}
+
+		if ((unsigned long long)total + (unsigned int)frame_sizes[i] > (unsigned int)-1) {
+			goto encode_fail;
+		}
+		total += (unsigned int)frame_sizes[i];
+	}
+
+	bytes = (unsigned char *)QOI_MALLOC(total);
+	if (bytes == NULL) {
+		goto encode_fail;
+	}
+
+	/* Container header */
+	p = 0;
+	qoi_write_32(bytes, &p, QOAF_MAGIC);
+	qoi_write_32(bytes, &p, QOAF_VERSION);
+	qoi_write_32(bytes, &p, (unsigned int)frame_count);
+	qoi_write_32(bytes, &p, descs[0].width);
+	qoi_write_32(bytes, &p, descs[0].height);
+	bytes[p++] = descs[0].channels;   /* [20] */
+	bytes[p++] = descs[0].colorspace; /* [21] */
+	bytes[p++] = 0;                   /* [22] flags high */
+	bytes[p++] = 0;                   /* [23] flags low  */
+	qoi_write_32(bytes, &p, 0);       /* [24..27] table_crc, patched below */
+
+	/* Offset table, then frame data */
+	p = QOAF_HEADER_SIZE;
+	{
+		unsigned int offset = data_start;
+		for (i = 0; i < frame_count; i++) {
+			unsigned short delay = opts ? opts[i].delay_ms : 0;
+			unsigned short flags = (opts && opts[i].keyframe) ? QOAF_FLAG_KEYFRAME : 0;
+
+			qoi_write_32(bytes, &p, offset);
+			qoi_write_32(bytes, &p, (unsigned int)frame_sizes[i]);
+			bytes[p++] = (unsigned char)(delay >> 8);
+			bytes[p++] = (unsigned char)(delay & 0xff);
+			bytes[p++] = (unsigned char)(flags >> 8);
+			bytes[p++] = (unsigned char)(flags & 0xff);
+
+			offset += (unsigned int)frame_sizes[i];
+		}
+	}
+
+	table_crc = qoaf_crc32(bytes + QOAF_HEADER_SIZE, (int)table_bytes);
+	{
+		int crc_p = 24;
+		qoi_write_32(bytes, &crc_p, table_crc);
+	}
+
+	{
+		unsigned int offset = data_start;
+		for (i = 0; i < frame_count; i++) {
+			memcpy(bytes + offset, frames[i], frame_sizes[i]);
+			offset += (unsigned int)frame_sizes[i];
+			QOI_FREE(frames[i]);
+		}
+	}
+
+	QOI_FREE(frames);
+	QOI_FREE(frame_sizes);
+
+	*out_len = (int)total;
+	return bytes;
+
+encode_fail:
+	for (i = 0; i < frame_count; i++) {
+		if (frames[i] != NULL) {
+			QOI_FREE(frames[i]);
+		}
+	}
+	QOI_FREE(frames);
+	QOI_FREE(frame_sizes);
+	return NULL;
+}
+
+void *qoaf_decode_frame(const void *data, int size, int index,
+	qoi_desc *desc, int channels, qoaf_frame_opts *opts)
+{
+	unsigned int frame_count;
+
+	if (
+		channels != 0 && channels != 3 && channels != 4
+	) {
+		return NULL;
+	}
+
+	frame_count = qoaf_validate(data, size);
+	if (frame_count == 0 || index < 0 || (unsigned int)index >= frame_count) {
+		return NULL;
+	}
+
+	return qoaf_decode_at(data, index, desc, channels, opts);
+}
+
+int qoaf_decode_all(const void *data, int size, int channels,
+	void ***out_frames, qoi_desc *desc, qoaf_frame_opts **out_descs)
+{
+	unsigned int frame_count;
+	void **frames;
+	qoaf_frame_opts *descs_opts;
+	unsigned int i;
+
+	if (
+		out_frames == NULL || desc == NULL ||
+		(channels != 0 && channels != 3 && channels != 4)
+	) {
+		return 0;
+	}
+
+	frame_count = qoaf_validate(data, size);
+	if (frame_count == 0) {
+		return 0;
+	}
+
+	frames = (void **)QOI_MALLOC((size_t)frame_count * sizeof(void *));
+	descs_opts = (qoaf_frame_opts *)QOI_MALLOC((size_t)frame_count * sizeof(qoaf_frame_opts));
+	if (frames == NULL || descs_opts == NULL) {
+		QOI_FREE(frames);
+		QOI_FREE(descs_opts);
+		return 0;
+	}
+
+	for (i = 0; i < frame_count; i++) {
+		frames[i] = qoaf_decode_at(data, (int)i, desc, channels, &descs_opts[i]);
+		if (frames[i] == NULL) {
+			unsigned int j;
+			for (j = 0; j < i; j++) {
+				QOI_FREE(frames[j]);
+			}
+			QOI_FREE(frames);
+			QOI_FREE(descs_opts);
+			return 0;
+		}
+	}
+
+	*out_frames = frames;
+	if (out_descs != NULL) {
+		*out_descs = descs_opts;
+	}
+	else {
+		QOI_FREE(descs_opts);
+	}
+	return (int)frame_count;
+}
+
+qoaf_player *qoaf_player_open(const void *data, int size) {
+	unsigned int frame_count = qoaf_validate(data, size);
+	qoaf_player *player;
+
+	if (frame_count == 0) {
+		return NULL;
+	}
+
+	player = (qoaf_player *)QOI_MALLOC(sizeof(qoaf_player));
+	if (player == NULL) {
+		return NULL;
+	}
+
+	player->data = (const unsigned char *)data;
+	player->size = size;
+	player->frame_count = frame_count;
+	player->pos = 0;
+	return player;
+}
+
+void qoaf_player_close(qoaf_player *player) {
+	QOI_FREE(player);
+}
+
+int qoaf_player_seek(qoaf_player *player, int index) {
+	if (
+		player == NULL || index < 0 ||
+		(unsigned int)index >= player->frame_count
+	) {
+		return 0;
+	}
+	player->pos = index;
+	return 1;
+}
+
+void *qoaf_player_next(qoaf_player *player, qoi_desc *desc, int channels,
+	qoaf_frame_opts *opts)
+{
+	void *pixels;
+
+	if (
+		player == NULL ||
+		(channels != 0 && channels != 3 && channels != 4) ||
+		(unsigned int)player->pos >= player->frame_count
+	) {
+		return NULL;
+	}
+
+	pixels = qoaf_decode_at(player->data, player->pos, desc, channels, opts);
+	if (pixels != NULL) {
+		player->pos++;
+	}
+	return pixels;
+}
+
+int qoaf_player_index(const qoaf_player *player) {
+	return player ? player->pos : -1;
+}
+
+int qoaf_player_count(const qoaf_player *player) {
+	return player ? (int)player->frame_count : 0;
+}
+
 #ifndef QOI_NO_STDIO
 #include <stdio.h>
 
@@ -643,6 +1148,67 @@ void *qoi_read(const char *filename, qoi_desc *desc, int channels) {
 	pixels = (bytes_read != size) ? NULL : qoi_decode(data, bytes_read, desc, channels);
 	QOI_FREE(data);
 	return pixels;
+}
+
+int qoaf_write(const char *filename, const void *data, int size) {
+	FILE *f;
+	int err;
+
+	if (filename == NULL || data == NULL || size <= 0) {
+		return 0;
+	}
+
+	f = fopen(filename, "wb");
+	if (!f) {
+		return 0;
+	}
+
+	fwrite(data, 1, size, f);
+	fflush(f);
+	err = ferror(f);
+	fclose(f);
+	return err ? 0 : size;
+}
+
+void *qoaf_read(const char *filename, int *out_len) {
+	FILE *f;
+	long size;
+	void *data;
+	size_t bytes_read;
+
+	if (filename == NULL || out_len == NULL) {
+		return NULL;
+	}
+	*out_len = 0;
+
+	f = fopen(filename, "rb");
+	if (!f) {
+		return NULL;
+	}
+
+	fseek(f, 0, SEEK_END);
+	size = ftell(f);
+	if (size <= 0 || fseek(f, 0, SEEK_SET) != 0) {
+		fclose(f);
+		return NULL;
+	}
+
+	data = QOI_MALLOC((size_t)size);
+	if (!data) {
+		fclose(f);
+		return NULL;
+	}
+
+	bytes_read = fread(data, 1, (size_t)size, f);
+	fclose(f);
+
+	if (bytes_read != (size_t)size) {
+		QOI_FREE(data);
+		return NULL;
+	}
+
+	*out_len = (int)size;
+	return data;
 }
 
 #endif /* QOI_NO_STDIO */
