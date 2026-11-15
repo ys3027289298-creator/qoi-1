@@ -289,6 +289,96 @@ The returned pixel data should be free()d after use. */
 void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels);
 
 
+/* Multi-frame container ("qoic"): a sequence of independently encoded QOI
+images, stored in one file or buffer. Each frame keeps its own pixel data
+and a display duration (delay) in milliseconds. The frames are played back
+in order; the start time of frame k is the sum of the delays of all frames
+before it.
+
+Container layout (all multi-byte integers are big endian):
+
+	container header (8 bytes)
+		char     magic[4];   // magic bytes "qoic"
+		uint32_t frame_count;
+
+	per frame, repeated frame_count times:
+		frame header (8 bytes)
+			uint32_t size;        // size of the QOI payload in bytes
+			uint32_t delay_ms;    // display duration in milliseconds
+		qoi payload (size bytes) // a complete, standalone QOI image
+
+Every frame is encoded with the regular qoi_encode() function, so the
+single-frame encoding is unchanged and each frame can also be decoded on its
+own with qoi_decode(). */
+
+typedef struct {
+	const void *data;     /* raw pixel data of one frame */
+	const qoi_desc *desc; /* width/height/channels/colorspace of the frame */
+	int delay_ms;         /* display duration of the frame in milliseconds */
+} qoi_frame;
+
+
+/* Encode a sequence of frames into a multi-frame container in memory. The
+qoi_desc describes the pixel data of every frame. Each frame additionally
+carries its own qoi_desc, which must match the common description; frames
+with inconsistent width, height, channels or colorspace are reported as
+failure. frame_count must be greater than 0 and every frame's delay_ms must
+be greater than or equal to 0; a negative delay or a frame_count of 0 is
+reported as failure.
+
+The function either returns NULL on failure (invalid parameters or malloc
+failed) or a pointer to the encoded container on success. On success the
+out_len is set to the size in bytes of the encoded container.
+
+The returned data should be free()d after use. */
+void *qoi_container_encode(const qoi_frame *frames, int frame_count,
+	const qoi_desc *desc, int *out_len);
+
+
+/* Read the common description and the number of frames of a multi-frame
+container. Returns 0 on failure (invalid data) or the number of frames on
+success. On success the qoi_desc struct is filled with the width, height,
+channels and colorspace shared by all frames. */
+int qoi_container_info(const void *data, int size, qoi_desc *desc);
+
+
+/* Read the description and delay of a single frame, without decoding its
+pixels. index is zero based and must be smaller than the frame count
+reported by qoi_container_info().
+
+Returns 0 on failure (invalid data or an out of range index) or 1 on
+success. On success the qoi_desc struct is filled with the frame's
+description and *delay_ms (if not NULL) with the frame's delay. */
+int qoi_container_frame_info(const void *data, int size, int index,
+	qoi_desc *desc, unsigned int *delay_ms);
+
+
+/* Decode all frames of a multi-frame container. If channels is 0, the
+number of channels from the file header is used. If channels is 3 or 4 the
+output format is forced into this number of channels.
+
+The function either returns NULL on failure (invalid data or malloc failed)
+or an array of frame_count pixel buffers on success; the qoi_desc struct is
+filled with the description shared by all frames. Each buffer and the array
+itself have to be free()d after use. */
+void **qoi_container_decode(const void *data, int size, qoi_desc *desc,
+	int channels);
+
+
+/* Decode only the frame at the given zero based index, skipping all frames
+before it. The pixels produced are identical to decoding the whole
+container and then taking the frame at the same index.
+
+The function either returns NULL on failure (invalid data, an out of range
+index or malloc failed) or a pointer to the decoded pixels. On success the
+qoi_desc struct is filled with the frame's description and *delay_ms (if
+not NULL) with the frame's delay.
+
+The returned pixel data should be free()d after use. */
+void *qoi_container_decode_frame(const void *data, int size, int index,
+	qoi_desc *desc, int channels, unsigned int *delay_ms);
+
+
 #ifdef __cplusplus
 }
 #endif
@@ -301,6 +391,7 @@ Implementation */
 #ifdef QOI_IMPLEMENTATION
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 #ifndef QOI_MALLOC
 	#define QOI_MALLOC(sz) malloc(sz)
@@ -586,6 +677,446 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 		}
 	}
 
+	return pixels;
+}
+
+#define QOI_CONTAINER_MAGIC \
+	(((unsigned int)'q') << 24 | ((unsigned int)'o') << 16 | \
+	 ((unsigned int)'i') <<  8 | ((unsigned int)'c'))
+#define QOI_CONTAINER_HEADER_SIZE 8
+#define QOI_FRAME_HEADER_SIZE 8
+
+/* Walk the frame directory of a container. When offsets is not NULL it is
+filled with the payload offset, payload size and delay of every frame.
+Returns the number of frames on success or 0 if the data is not a valid
+container. */
+static int qoi_container_scan(const unsigned char *bytes, int size,
+	int *offsets, int *sizes, unsigned int *delays)
+{
+	unsigned int magic, frame_count;
+	int pos, i;
+
+	if (
+		bytes == NULL ||
+		size < QOI_CONTAINER_HEADER_SIZE
+	) {
+		return 0;
+	}
+
+	pos = 0;
+	magic = qoi_read_32(bytes, &pos);
+	frame_count = qoi_read_32(bytes, &pos);
+
+	if (magic != QOI_CONTAINER_MAGIC || frame_count == 0) {
+		return 0;
+	}
+
+	for (i = 0; i < (int)frame_count; i++) {
+		unsigned int frame_size, delay_ms;
+		long long next_pos;
+
+		if (pos + QOI_FRAME_HEADER_SIZE > size) {
+			return 0;
+		}
+
+		frame_size = qoi_read_32(bytes, &pos);
+		delay_ms = qoi_read_32(bytes, &pos);
+
+		if (frame_size == 0) {
+			return 0;
+		}
+
+		next_pos = (long long)pos + (long long)frame_size;
+		if (next_pos > size) {
+			return 0;
+		}
+
+		if (offsets != NULL) {
+			offsets[i] = pos;
+			sizes[i] = (int)frame_size;
+		}
+		if (delays != NULL) {
+			delays[i] = delay_ms;
+		}
+
+		pos = (int)next_pos;
+	}
+
+	if (pos != size) {
+		return 0;
+	}
+
+	return (int)frame_count;
+}
+
+/* Read and validate the 14 byte header of an embedded QOI payload without
+decoding any pixels. Returns 1 on success and fills desc, or 0 on failure. */
+static int qoi_container_read_payload_header(const unsigned char *bytes,
+	int payload_size, qoi_desc *desc)
+{
+	unsigned int magic;
+	int p = 0;
+
+	if (payload_size < QOI_HEADER_SIZE + (int)sizeof(qoi_padding)) {
+		return 0;
+	}
+
+	magic = qoi_read_32(bytes, &p);
+	desc->width = qoi_read_32(bytes, &p);
+	desc->height = qoi_read_32(bytes, &p);
+	desc->channels = bytes[p++];
+	desc->colorspace = bytes[p++];
+
+	return (
+		magic == QOI_MAGIC &&
+		desc->width != 0 && desc->height != 0 &&
+		desc->channels >= 3 && desc->channels <= 4 &&
+		desc->colorspace <= 1 &&
+		desc->height < QOI_PIXELS_MAX / desc->width
+	);
+}
+
+void *qoi_container_encode(const qoi_frame *frames, int frame_count,
+	const qoi_desc *desc, int *out_len)
+{
+	int i, p, total_size;
+	long long required;
+	unsigned char *bytes;
+	int *frame_sizes;
+	void **frame_payloads;
+
+	if (
+		frames == NULL || desc == NULL || out_len == NULL ||
+		frame_count <= 0
+	) {
+		return NULL;
+	}
+
+	/* Encode and validate every frame before writing the container. All
+	frames must carry pixel data and share the geometry of the common
+	qoi_desc. */
+	required = QOI_CONTAINER_HEADER_SIZE;
+	frame_sizes = (int *) QOI_MALLOC((size_t)frame_count * sizeof(int));
+	frame_payloads = (void **) QOI_MALLOC((size_t)frame_count * sizeof(void *));
+	if (!frame_sizes) {
+		return NULL;
+	}
+	if (!frame_payloads) {
+		QOI_FREE(frame_sizes);
+		return NULL;
+	}
+
+	for (i = 0; i < frame_count; i++) {
+		qoi_desc frame_desc;
+		void *encoded;
+		int encoded_len;
+
+		if (
+			frames[i].data == NULL || frames[i].desc == NULL ||
+			frames[i].delay_ms < 0 ||
+			frames[i].desc->width != desc->width ||
+			frames[i].desc->height != desc->height ||
+			frames[i].desc->channels != desc->channels ||
+			frames[i].desc->colorspace != desc->colorspace
+		) {
+			int j;
+			for (j = 0; j < i; j++) {
+				QOI_FREE(frame_payloads[j]);
+			}
+			QOI_FREE(frame_payloads);
+			QOI_FREE(frame_sizes);
+			return NULL;
+		}
+
+		/* qoi_encode() rejects zero dimensions, bad channels, etc. */
+		encoded = qoi_encode(frames[i].data, desc, &encoded_len);
+		if (encoded == NULL) {
+			int j;
+			for (j = 0; j < i; j++) {
+				QOI_FREE(frame_payloads[j]);
+			}
+			QOI_FREE(frame_payloads);
+			QOI_FREE(frame_sizes);
+			return NULL;
+		}
+
+		/* Every payload is a standalone QOI image. qoi_encode() already
+		guarantees the header matches desc; reading the header back just
+		verifies the payload starts with a well formed QOI header. */
+		if (!qoi_container_read_payload_header(
+			(const unsigned char *)encoded, encoded_len, &frame_desc)) {
+			int j;
+			for (j = 0; j < i; j++) {
+				QOI_FREE(frame_payloads[j]);
+			}
+			QOI_FREE(frame_payloads);
+			QOI_FREE(encoded);
+			QOI_FREE(frame_sizes);
+			return NULL;
+		}
+
+		if (
+			frame_desc.width != desc->width ||
+			frame_desc.height != desc->height ||
+			frame_desc.channels != desc->channels ||
+			frame_desc.colorspace != desc->colorspace
+		) {
+			int j;
+			for (j = 0; j < i; j++) {
+				QOI_FREE(frame_payloads[j]);
+			}
+			QOI_FREE(frame_payloads);
+			QOI_FREE(encoded);
+			QOI_FREE(frame_sizes);
+			return NULL;
+		}
+
+		frame_payloads[i] = encoded;
+		frame_sizes[i] = encoded_len;
+		required += QOI_FRAME_HEADER_SIZE + (long long)encoded_len;
+
+		if (required > (long long)INT_MAX) {
+			int j;
+			for (j = 0; j <= i; j++) {
+				QOI_FREE(frame_payloads[j]);
+			}
+			QOI_FREE(frame_payloads);
+			QOI_FREE(frame_sizes);
+			return NULL;
+		}
+	}
+
+	total_size = (int)required;
+	bytes = (unsigned char *) QOI_MALLOC(total_size);
+	if (!bytes) {
+		for (i = 0; i < frame_count; i++) {
+			QOI_FREE(frame_payloads[i]);
+		}
+		QOI_FREE(frame_payloads);
+		QOI_FREE(frame_sizes);
+		return NULL;
+	}
+
+	p = 0;
+	qoi_write_32(bytes, &p, QOI_CONTAINER_MAGIC);
+	qoi_write_32(bytes, &p, (unsigned int)frame_count);
+
+	for (i = 0; i < frame_count; i++) {
+		qoi_write_32(bytes, &p, (unsigned int)frame_sizes[i]);
+		qoi_write_32(bytes, &p, (unsigned int)frames[i].delay_ms);
+		memcpy(bytes + p, frame_payloads[i], frame_sizes[i]);
+		p += frame_sizes[i];
+		QOI_FREE(frame_payloads[i]);
+	}
+
+	QOI_FREE(frame_payloads);
+	QOI_FREE(frame_sizes);
+
+	if (p != total_size) {
+		QOI_FREE(bytes);
+		return NULL;
+	}
+
+	*out_len = total_size;
+	return bytes;
+}
+
+int qoi_container_info(const void *data, int size, qoi_desc *desc) {
+	const unsigned char *bytes;
+	int frame_count, payload_offset;
+
+	if (data == NULL || desc == NULL) {
+		return 0;
+	}
+
+	frame_count = qoi_container_scan((const unsigned char *)data, size,
+		NULL, NULL, NULL);
+	if (frame_count == 0) {
+		return 0;
+	}
+
+	/* The first payload always starts right after the two headers. */
+	bytes = (const unsigned char *)data;
+	payload_offset = QOI_CONTAINER_HEADER_SIZE + QOI_FRAME_HEADER_SIZE;
+	if (!qoi_container_read_payload_header(bytes + payload_offset,
+		size - payload_offset, desc)) {
+		return 0;
+	}
+
+	return frame_count;
+}
+
+int qoi_container_frame_info(const void *data, int size, int index,
+	qoi_desc *desc, unsigned int *delay_ms)
+{
+	const unsigned char *bytes;
+	int frame_count, pos, i;
+
+	if (data == NULL || desc == NULL || index < 0) {
+		return 0;
+	}
+
+	frame_count = qoi_container_scan((const unsigned char *)data, size,
+		NULL, NULL, NULL);
+	if (frame_count == 0 || index >= frame_count) {
+		return 0;
+	}
+
+	bytes = (const unsigned char *)data;
+	pos = QOI_CONTAINER_HEADER_SIZE;
+	for (i = 0; i < index; i++) {
+		unsigned int frame_size;
+		int p = pos;
+		frame_size = qoi_read_32(bytes, &p);
+		pos = p + 4 + (int)frame_size;
+	}
+
+	{
+		int p = pos;
+		unsigned int frame_size = qoi_read_32(bytes, &p);
+		unsigned int delay = qoi_read_32(bytes, &p);
+
+		if (!qoi_container_read_payload_header(bytes + p,
+			(int)frame_size, desc)) {
+			return 0;
+		}
+		if (delay_ms != NULL) {
+			*delay_ms = delay;
+		}
+	}
+
+	return 1;
+}
+
+void **qoi_container_decode(const void *data, int size, qoi_desc *desc,
+	int channels)
+{
+	const unsigned char *bytes;
+	int frame_count, i;
+	int *offsets, *sizes;
+	void **frames;
+
+	if (
+		data == NULL || desc == NULL ||
+		(channels != 0 && channels != 3 && channels != 4)
+	) {
+		return NULL;
+	}
+
+	bytes = (const unsigned char *)data;
+
+	{
+		int count = qoi_container_scan(bytes, size, NULL, NULL, NULL);
+		if (count == 0) {
+			return NULL;
+		}
+		frame_count = count;
+	}
+
+	offsets = (int *) QOI_MALLOC((size_t)frame_count * sizeof(int));
+	sizes = (int *) QOI_MALLOC((size_t)frame_count * sizeof(int));
+	frames = (void **) QOI_MALLOC((size_t)frame_count * sizeof(void *));
+
+	if (!offsets || !sizes || !frames) {
+		QOI_FREE(offsets);
+		QOI_FREE(sizes);
+		QOI_FREE(frames);
+		return NULL;
+	}
+
+	if (
+		qoi_container_scan(bytes, size, offsets, sizes, NULL) !=
+		frame_count
+	) {
+		QOI_FREE(offsets);
+		QOI_FREE(sizes);
+		QOI_FREE(frames);
+		return NULL;
+	}
+
+	for (i = 0; i < frame_count; i++) {
+		qoi_desc frame_desc;
+
+		frames[i] = qoi_decode(bytes + offsets[i], sizes[i],
+			&frame_desc, channels);
+		if (frames[i] == NULL) {
+			int j;
+			for (j = 0; j < i; j++) {
+				QOI_FREE(frames[j]);
+			}
+			QOI_FREE(offsets);
+			QOI_FREE(sizes);
+			QOI_FREE(frames);
+			return NULL;
+		}
+
+		if (
+			frame_desc.width != desc->width ||
+			frame_desc.height != desc->height ||
+			frame_desc.colorspace != desc->colorspace
+		) {
+			int j;
+			for (j = 0; j <= i; j++) {
+				QOI_FREE(frames[j]);
+			}
+			QOI_FREE(offsets);
+			QOI_FREE(sizes);
+			QOI_FREE(frames);
+			return NULL;
+		}
+	}
+
+	QOI_FREE(offsets);
+	QOI_FREE(sizes);
+	return frames;
+}
+
+void *qoi_container_decode_frame(const void *data, int size, int index,
+	qoi_desc *desc, int channels, unsigned int *delay_ms)
+{
+	const unsigned char *bytes;
+	int frame_count, pos, i;
+	unsigned int frame_size, delay;
+	void *pixels;
+
+	if (
+		data == NULL || desc == NULL || index < 0 ||
+		(channels != 0 && channels != 3 && channels != 4)
+	) {
+		return NULL;
+	}
+
+	frame_count = qoi_container_scan((const unsigned char *)data, size,
+		NULL, NULL, NULL);
+	if (frame_count == 0 || index >= frame_count) {
+		return NULL;
+	}
+
+	/* Traverse the directory to locate frame `index`; no earlier frame
+	is ever decoded. */
+	bytes = (const unsigned char *)data;
+	pos = QOI_CONTAINER_HEADER_SIZE;
+	for (i = 0; i < index; i++) {
+		int p = pos;
+		unsigned int skip_size = qoi_read_32(bytes, &p);
+		pos = p + 4 + (int)skip_size;
+	}
+
+	{
+		int p = pos;
+		frame_size = qoi_read_32(bytes, &p);
+		delay = qoi_read_32(bytes, &p);
+		pos = p;
+	}
+
+	pixels = qoi_decode(bytes + pos, (int)frame_size, desc, channels);
+	if (pixels == NULL) {
+		return NULL;
+	}
+
+	if (delay_ms != NULL) {
+		*delay_ms = delay;
+	}
 	return pixels;
 }
 
