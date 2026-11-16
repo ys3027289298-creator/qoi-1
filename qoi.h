@@ -273,7 +273,19 @@ The function either returns NULL on failure (invalid parameters or malloc
 failed) or a pointer to the encoded data on success. On success the out_len
 is set to the size in bytes of the encoded data.
 
-The returned qoi data should be free()d after use. */
+The returned qoi data should be free()d after use.
+
+The encoder has an optional SIMD fast path (x86 AVX2) that speeds up the
+per-pixel comparison, color hash and difference classification. It is used
+automatically when the CPU supports AVX2; the produced QOI stream is
+byte-for-byte identical to the scalar encoder. It can be disabled:
+
+ - at compile time by defining QOI_NO_SIMD before including this file; the
+   resulting binary contains no SIMD code at all.
+ - at run time by setting the environment variable QOI_SIMD=0 (checked at the
+   start of every qoi_encode() call, so one binary can exercise both paths).
+
+No public function signature changes. */
 
 void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len);
 
@@ -308,6 +320,33 @@ Implementation */
 #endif
 #ifndef QOI_ZEROARR
 	#define QOI_ZEROARR(a) memset((a),0,sizeof(a))
+#endif
+
+/* -----------------------------------------------------------------------------
+SIMD fast path (optional)
+
+The encoder compares each pixel with its predecessor, hashes it and checks the
+DIFF/LUMA ranges for every pixel. On x86 these steps are vectorized with AVX2;
+chunk emission itself stays in pixel order. The emitted QOI byte stream is
+identical to the scalar path for both supported input formats (3 = RGB,
+4 = RGBA), so enabling SIMD never changes the encoded bytes.
+
+Disabled by defining QOI_NO_SIMD at compile time (no SIMD code is emitted).
+At run time QOI_SIMD=0 disables the fast path for the same binary. If the CPU
+(or OS) does not support AVX2 the scalar loop is used automatically. */
+
+/* The vector core loads pixels as 32-bit lanes and packs chunk bytes into
+machine words, so it is restricted to little-endian targets. Everything else
+(including big-endian) takes the scalar core, which is byte-exact by
+construction. */
+#if !defined(QOI_NO_SIMD) && \
+	(defined(__x86_64__) || defined(__i386__)) && \
+	(defined(__clang__) || (defined(__GNUC__) && \
+		(__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 8)))) && \
+	defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__) && \
+	!defined(__EMSCRIPTEN__)
+	#define QOI_SIMD_X86 1
+	#include <immintrin.h>
 #endif
 
 #define QOI_OP_INDEX  0x00 /* 00xxxxxx */
@@ -353,42 +392,28 @@ static unsigned int qoi_read_32(const unsigned char *bytes, int *p) {
 	return a << 24 | b << 16 | c << 8 | d;
 }
 
-void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
-	int i, max_size, p, run;
-	int px_len, px_end, px_pos, channels;
-	unsigned char *bytes;
-	const unsigned char *pixels;
+
+/* -----------------------------------------------------------------------------
+Encoder cores
+
+qoi_encode() validates, allocates and writes the header, then calls one of the
+two cores below to produce the chunks. Both cores emit exactly the same bytes;
+they differ only in how the per-pixel work is scheduled.
+
+- qoi_encode_core_scalar() is the reference pixel loop. It is the canonical
+  definition of the format and is always compiled, so every build has it.
+- qoi_encode_core_simd() (x86 AVX2 only) classifies 8 pixels at a time with
+  vector compares: run detection, the color hash, and the DIFF/LUMA range
+  tests. Chunk bytes are still appended in pixel order by a short scalar
+  loop, so the output is byte-for-byte identical to the scalar core. */
+
+static int qoi_encode_core_scalar(
+	const unsigned char *pixels, int px_len, int channels,
+	unsigned char *bytes, int p
+) {
+	int i, run, px_end, px_pos;
 	qoi_rgba_t index[64];
 	qoi_rgba_t px, px_prev;
-
-	if (
-		data == NULL || out_len == NULL || desc == NULL ||
-		desc->width == 0 || desc->height == 0 ||
-		desc->channels < 3 || desc->channels > 4 ||
-		desc->colorspace > 1 ||
-		desc->height >= QOI_PIXELS_MAX / desc->width
-	) {
-		return NULL;
-	}
-
-	max_size =
-		desc->width * desc->height * (desc->channels + 1) +
-		QOI_HEADER_SIZE + sizeof(qoi_padding);
-
-	p = 0;
-	bytes = (unsigned char *) QOI_MALLOC(max_size);
-	if (!bytes) {
-		return NULL;
-	}
-
-	qoi_write_32(bytes, &p, QOI_MAGIC);
-	qoi_write_32(bytes, &p, desc->width);
-	qoi_write_32(bytes, &p, desc->height);
-	bytes[p++] = desc->channels;
-	bytes[p++] = desc->colorspace;
-
-
-	pixels = (const unsigned char *)data;
 
 	QOI_ZEROARR(index);
 
@@ -399,9 +424,7 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	px_prev.rgba.a = 255;
 	px = px_prev;
 
-	px_len = desc->width * desc->height * desc->channels;
-	px_end = px_len - desc->channels;
-	channels = desc->channels;
+	px_end = px_len - channels;
 
 	for (px_pos = 0; px_pos < px_len; px_pos += channels) {
 		px.rgba.r = pixels[px_pos + 0];
@@ -479,6 +502,382 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 
 	for (i = 0; i < (int)sizeof(qoi_padding); i++) {
 		bytes[p++] = qoi_padding[i];
+	}
+
+	return p;
+}
+
+
+#if defined(QOI_SIMD_X86)
+
+#define QOI_SIMD_TARGET __attribute__((target("avx2")))
+/* __inline__ rather than inline, so the header also compiles as C89. */
+#define QOI_SIMD_INLINE static __inline__ __attribute__((always_inline))
+
+/* Load 8 RGB pixels (24 bytes) as 8 RGBA lanes with alpha 255. Both 16-byte
+unaligned loads stay inside the 24 bytes of the group (bytes 0..15 and
+8..23), so every read is in bounds whenever 8 pixels are available. */
+QOI_SIMD_TARGET QOI_SIMD_INLINE __m256i qoi_simd_load8_rgb(const unsigned char *p) {
+	__m128i lo = _mm_loadu_si128((const __m128i *)p);
+	__m128i hi = _mm_loadu_si128((const __m128i *)(p + 8));
+	__m128i l0 = _mm_shuffle_epi8(lo, _mm_setr_epi8(
+		0,1,2,-1, 3,4,5,-1, 6,7,8,-1, 9,10,11,-1));
+	__m128i l1 = _mm_shuffle_epi8(hi, _mm_setr_epi8(
+		4,5,6,-1, 7,8,9,-1, 10,11,12,-1, 13,14,15,-1));
+	__m256i v = _mm256_castsi128_si256(l0);
+	v = _mm256_inserti128_si256(v, l1, 1);
+	return _mm256_or_si256(v, _mm256_set1_epi32((int)0xff000000u));
+}
+
+/* Emit one pixel exactly like the scalar core does, for the prologue/tail and
+for the lanes of a vector group. `is_last` marks the final pixel of the image,
+which flushes an open run. */
+QOI_SIMD_INLINE int qoi_simd_emit(
+	unsigned int x, unsigned int prev, unsigned int *index,
+	int *run, unsigned char *bytes, int p, int is_last
+) {
+	if (x == prev) {
+		(*run)++;
+		if (*run == 62 || is_last) {
+			bytes[p++] = QOI_OP_RUN | (*run - 1);
+			*run = 0;
+		}
+	}
+	else {
+		unsigned int r = x & 0xff, g = (x >> 8) & 0xff;
+		unsigned int b = (x >> 16) & 0xff, a = x >> 24;
+		unsigned int pr = prev & 0xff, pg = (prev >> 8) & 0xff;
+		unsigned int pb = (prev >> 16) & 0xff, pa = prev >> 24;
+		int index_pos;
+
+		if (*run > 0) {
+			bytes[p++] = QOI_OP_RUN | (*run - 1);
+			*run = 0;
+		}
+
+		index_pos = (int)((r * 3 + g * 5 + b * 7 + a * 11) & (64 - 1));
+
+		if (index[index_pos] == x) {
+			bytes[p++] = QOI_OP_INDEX | index_pos;
+		}
+		else {
+			index[index_pos] = x;
+
+			if (a == pa) {
+				signed char vr = (signed char)(r - pr);
+				signed char vg = (signed char)(g - pg);
+				signed char vb = (signed char)(b - pb);
+				signed char vg_r = (signed char)(vr - vg);
+				signed char vg_b = (signed char)(vb - vg);
+
+				if (
+					vr > -3 && vr < 2 &&
+					vg > -3 && vg < 2 &&
+					vb > -3 && vb < 2
+				) {
+					bytes[p++] = QOI_OP_DIFF | (vr + 2) << 4 | (vg + 2) << 2 | (vb + 2);
+				}
+				else if (
+					vg_r >  -9 && vg_r <  8 &&
+					vg   > -33 && vg   < 32 &&
+					vg_b >  -9 && vg_b <  8
+				) {
+					bytes[p++] = QOI_OP_LUMA     | (vg   + 32);
+					bytes[p++] = (vg_r + 8) << 4 | (vg_b +  8);
+				}
+				else {
+					bytes[p++] = QOI_OP_RGB;
+					bytes[p++] = (unsigned char)r;
+					bytes[p++] = (unsigned char)g;
+					bytes[p++] = (unsigned char)b;
+				}
+			}
+			else {
+				bytes[p++] = QOI_OP_RGBA;
+				bytes[p++] = (unsigned char)r;
+				bytes[p++] = (unsigned char)g;
+				bytes[p++] = (unsigned char)b;
+				bytes[p++] = (unsigned char)a;
+			}
+		}
+	}
+	return p;
+}
+
+QOI_SIMD_TARGET
+static int qoi_encode_core_simd(
+	const unsigned char *pixels, int px_len, int channels,
+	unsigned char *bytes, int p
+) {
+	const unsigned int total = (unsigned int)px_len / (unsigned int)channels;
+	const __m256i vmask = _mm256_set1_epi32(0xff);
+	const __m256i c3 = _mm256_set1_epi32(3), c5 = _mm256_set1_epi32(5);
+	const __m256i c7 = _mm256_set1_epi32(7), c11 = _mm256_set1_epi32(11);
+	const __m256i c63 = _mm256_set1_epi32(63);
+	const __m256i mn3 = _mm256_set1_epi32(-3), c2 = _mm256_set1_epi32(2);
+	const __m256i m9 = _mm256_set1_epi32(-9), c8 = _mm256_set1_epi32(8);
+	const __m256i c33 = _mm256_set1_epi32(-33), c32 = _mm256_set1_epi32(32);
+	const __m256i shift = _mm256_setr_epi32(0,0,1,2,3,4,5,6);
+	unsigned int index[64];
+	unsigned int i = 0, prev = 0xff000000u;
+	int run = 0;
+
+	QOI_ZEROARR(index);
+
+	for (; i + 8 <= total; i += 8) {
+		__m256i cur = (channels == 4)
+			? _mm256_loadu_si256((const __m256i *)(pixels + 4 * (size_t)i))
+			: qoi_simd_load8_rgb(pixels + 3 * (size_t)i);
+		__m256i prv = _mm256_permutevar8x32_epi32(cur, shift);
+		__m256i r, g, b, a, pr, pg, pb, pa, dr, dg, db, dgr, dgb, hv;
+		int eqmask, diffmask, lumamask, aeqmask;
+		int hb[8], dvb[8], lvb[8], xb[8];
+
+		prv = _mm256_insert_epi32(prv, (int)prev, 0);
+		eqmask = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(cur, prv)));
+
+		/* The whole group repeats the previous pixel: extend the run without
+		touching the per-lane path. 8 is the most a run can gain per group,
+		so one 62-flush at most is needed here. */
+		if (eqmask == 0xff) {
+			run += 8;
+			while (run >= 62) {
+				bytes[p++] = QOI_OP_RUN | 61;
+				run -= 62;
+			}
+			if (channels == 4) {
+				prev = (unsigned int)((const unsigned int *)(pixels + 4 * (size_t)i))[7];
+			}
+			else {
+				const unsigned char *q = pixels + 3 * (size_t)(i + 7);
+				prev = (unsigned int)q[0] | ((unsigned int)q[1] << 8) |
+					((unsigned int)q[2] << 16) | 0xff000000u;
+			}
+			continue;
+		}
+
+		r = _mm256_and_si256(cur, vmask);
+		g = _mm256_and_si256(_mm256_srli_epi32(cur, 8), vmask);
+		b = _mm256_and_si256(_mm256_srli_epi32(cur, 16), vmask);
+		a = _mm256_srli_epi32(cur, 24);
+		pr = _mm256_and_si256(prv, vmask);
+		pg = _mm256_and_si256(_mm256_srli_epi32(prv, 8), vmask);
+		pb = _mm256_and_si256(_mm256_srli_epi32(prv, 16), vmask);
+		pa = _mm256_srli_epi32(prv, 24);
+
+		/* signed byte differences, sign-extended */
+		dr = _mm256_srai_epi32(_mm256_slli_epi32(_mm256_sub_epi32(r, pr), 24), 24);
+		dg = _mm256_srai_epi32(_mm256_slli_epi32(_mm256_sub_epi32(g, pg), 24), 24);
+		db = _mm256_srai_epi32(_mm256_slli_epi32(_mm256_sub_epi32(b, pb), 24), 24);
+		dgr = _mm256_srai_epi32(_mm256_slli_epi32(_mm256_sub_epi32(dr, dg), 24), 24);
+		dgb = _mm256_srai_epi32(_mm256_slli_epi32(_mm256_sub_epi32(db, dg), 24), 24);
+
+		diffmask = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_and_si256(
+			_mm256_and_si256(
+				_mm256_and_si256(_mm256_cmpgt_epi32(dr, mn3), _mm256_cmpgt_epi32(c2, dr)),
+				_mm256_and_si256(_mm256_cmpgt_epi32(dg, mn3), _mm256_cmpgt_epi32(c2, dg))),
+			_mm256_and_si256(_mm256_cmpgt_epi32(db, mn3), _mm256_cmpgt_epi32(c2, db)))));
+		lumamask = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_and_si256(
+			_mm256_and_si256(
+				_mm256_and_si256(_mm256_cmpgt_epi32(dgr, m9), _mm256_cmpgt_epi32(c8, dgr)),
+				_mm256_and_si256(_mm256_cmpgt_epi32(dg, c33), _mm256_cmpgt_epi32(c32, dg))),
+			_mm256_and_si256(_mm256_cmpgt_epi32(dgb, m9), _mm256_cmpgt_epi32(c8, dgb)))));
+		aeqmask = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(a, pa)));
+
+		hv = _mm256_and_si256(
+			_mm256_add_epi32(
+				_mm256_add_epi32(_mm256_mullo_epi32(r, c3), _mm256_mullo_epi32(g, c5)),
+				_mm256_add_epi32(_mm256_mullo_epi32(b, c7), _mm256_mullo_epi32(a, c11))),
+			c63);
+		_mm256_storeu_si256((__m256i *)hb, hv);
+		_mm256_storeu_si256((__m256i *)xb, cur);
+
+		/* Pre-pack the DIFF and LUMA chunks for all 8 lanes. */
+		{
+			const __m256i two = _mm256_set1_epi32(2), eight = _mm256_set1_epi32(8);
+			const __m256i b32 = _mm256_set1_epi32(32);
+			const __m256i o40 = _mm256_set1_epi32(0x40), o80 = _mm256_set1_epi32(0x80);
+			__m256i dv = _mm256_or_si256(o40, _mm256_or_si256(
+				_mm256_or_si256(
+					_mm256_slli_epi32(_mm256_add_epi32(dr, two), 4),
+					_mm256_slli_epi32(_mm256_add_epi32(dg, two), 2)),
+				_mm256_add_epi32(db, two)));
+			__m256i lv = _mm256_or_si256(
+				_mm256_or_si256(o80, _mm256_add_epi32(dg, b32)),
+				_mm256_slli_epi32(_mm256_or_si256(
+					_mm256_slli_epi32(_mm256_add_epi32(dgr, eight), 4),
+					_mm256_add_epi32(dgb, eight)), 8));
+			_mm256_storeu_si256((__m256i *)dvb, dv);
+			_mm256_storeu_si256((__m256i *)lvb, lv);
+		}
+
+		/* Emit the 8 lanes in order. The index hash and the DIFF/LUMA masks
+		come from the vector pass; everything that depends on earlier lanes
+		(run length, previous pixel, index contents) is serial by design. */
+		{
+			int j;
+			for (j = 0; j < 8; j++) {
+				unsigned int x = (unsigned int)xb[j];
+				if (eqmask & (1 << j)) {
+					run++;
+					if (run == 62) {
+						bytes[p++] = QOI_OP_RUN | (run - 1);
+						run = 0;
+					}
+				}
+				else {
+					int index_pos, is_diff, is_luma, alpha_eq;
+
+					if (run > 0) {
+						bytes[p++] = QOI_OP_RUN | (run - 1);
+						run = 0;
+					}
+
+					index_pos = hb[j];
+					is_diff = (diffmask >> j) & 1;
+					is_luma = (lumamask >> j) & 1;
+					alpha_eq = (channels == 4) ? ((aeqmask >> j) & 1) : 1;
+
+					if (index[index_pos] == x) {
+						bytes[p++] = QOI_OP_INDEX | index_pos;
+					}
+					else {
+						index[index_pos] = x;
+
+						if (!alpha_eq) {
+							/* little-endian only: one store writes all five bytes */
+							unsigned long long w8 = 0xffu | ((unsigned long long)x << 8);
+							memcpy(bytes + p, &w8, 8);
+							p += 5;
+						}
+						else if (is_diff) {
+							bytes[p++] = (unsigned char)(dvb[j] & 0xff);
+						}
+						else if (is_luma) {
+							bytes[p++] = (unsigned char)(lvb[j] & 0xff);
+							bytes[p++] = (unsigned char)((lvb[j] >> 8) & 0xff);
+						}
+						else {
+							unsigned int w4 = QOI_OP_RGB | (x << 8);
+							memcpy(bytes + p, &w4, 4);
+							p += 4;
+						}
+					}
+				}
+				prev = x;
+			}
+		}
+	}
+
+	/* Tail: fewer than 8 pixels left. */
+	for (; i < total; i++) {
+		unsigned int x;
+		if (channels == 4) {
+			x = (unsigned int)((const unsigned int *)(pixels + 4 * (size_t)i))[0];
+		}
+		else {
+			const unsigned char *q = pixels + 3 * (size_t)i;
+			x = (unsigned int)q[0] | ((unsigned int)q[1] << 8) |
+				((unsigned int)q[2] << 16) | 0xff000000u;
+		}
+		p = qoi_simd_emit(x, prev, index, &run, bytes, p, i == total - 1);
+		prev = x;
+	}
+
+	/* A run that ends exactly at the last pixel of a vector group is
+	flushed here; the total run length never exceeds 62. */
+	if (run > 0) {
+		bytes[p++] = QOI_OP_RUN | (run - 1);
+	}
+
+	for (i = 0; i < (int)sizeof(qoi_padding); i++) {
+		bytes[p++] = qoi_padding[i];
+	}
+
+	return p;
+}
+
+#endif /* QOI_SIMD_X86 */
+
+#if defined(QOI_SIMD_X86)
+/* Runtime gate for the SIMD core.
+
+QOI_SIMD_CPU_SUPPORTED() is the hardware probe; the default is GCC/Clang's
+CPUID-based check. It can be overridden at compile time (used by the test
+harness to simulate a CPU without AVX2); it must be a valid expression.
+
+QOI_SIMD=0 in the environment forces the scalar path for the same binary.
+The variable is consulted on every call, so both paths can be compared without
+rebuilding and no mutable process state is shared between callers. In
+freestanding builds (no libc environment) the variable is not read; define
+QOI_NO_GETENV to force that behaviour on hosted builds as well. */
+
+#ifndef QOI_SIMD_CPU_SUPPORTED
+	#define QOI_SIMD_CPU_SUPPORTED() \
+		(__builtin_cpu_init(), __builtin_cpu_supports("avx2") != 0)
+#endif
+
+static int qoi_simd_use(void) {
+#if !defined(QOI_NO_GETENV) && defined(__STDC_HOSTED__) && __STDC_HOSTED__
+	const char *env = getenv("QOI_SIMD");
+	if (env != NULL && env[0] == '0' && env[1] == '\0') {
+		return 0;
+	}
+#endif
+	return QOI_SIMD_CPU_SUPPORTED() ? 1 : 0;
+}
+#endif
+
+
+void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
+	int max_size, p;
+	unsigned char *bytes;
+	const unsigned char *pixels;
+
+	if (
+		data == NULL || out_len == NULL || desc == NULL ||
+		desc->width == 0 || desc->height == 0 ||
+		desc->channels < 3 || desc->channels > 4 ||
+		desc->colorspace > 1 ||
+		desc->height >= QOI_PIXELS_MAX / desc->width
+	) {
+		return NULL;
+	}
+
+	max_size =
+		desc->width * desc->height * (desc->channels + 1) +
+		QOI_HEADER_SIZE + sizeof(qoi_padding);
+
+	p = 0;
+	bytes = (unsigned char *) QOI_MALLOC(max_size);
+	if (!bytes) {
+		return NULL;
+	}
+
+	qoi_write_32(bytes, &p, QOI_MAGIC);
+	qoi_write_32(bytes, &p, desc->width);
+	qoi_write_32(bytes, &p, desc->height);
+	bytes[p++] = desc->channels;
+	bytes[p++] = desc->colorspace;
+
+	pixels = (const unsigned char *)data;
+
+#if defined(QOI_SIMD_X86)
+	if (qoi_simd_use()) {
+		p = qoi_encode_core_simd(
+			pixels,
+			desc->width * desc->height * desc->channels,
+			desc->channels,
+			bytes, p);
+	}
+	else
+#endif
+	{
+		p = qoi_encode_core_scalar(
+			pixels,
+			desc->width * desc->height * desc->channels,
+			desc->channels,
+			bytes, p);
 	}
 
 	*out_len = p;
