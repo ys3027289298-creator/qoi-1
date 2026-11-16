@@ -289,6 +289,59 @@ The returned pixel data should be free()d after use. */
 void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels);
 
 
+/* ---- LZ77 post-processing layer -----------------------------------------
+
+An optional, self-contained LZ77 transform that can be applied to any byte
+buffer (e.g. the output of qoi_encode) to squeeze out redundancy the QOI
+format leaves behind, and later be reversed to recover the exact original
+bytes. No third party code is used.
+
+A qolz stream consists of a 12 byte big-endian header
+
+	"qolz"  uint8 log2(window_size)  uint8 log2(min_match)  uint16 reserved
+	uint32 original_size
+
+followed by one or more blocks. Each block holds a 32-bit big-endian token
+count (its high bit is the block type: 0 = LZ77 tokens, 1 = raw stored
+bytes), a 32-bit big-endian payload length and either a bit-packed LZ77
+token stream or the verbatim input bytes:
+
+	flag 1 bit     0 = literal, followed by 8 data bits
+	               1 = match,   followed by
+	                              length    : variable length unsigned integer,
+	                                           stored value = match_len - min_match
+	                              distance-1: variable length unsigned integer
+	                              distance  : 1..window_size, most recent byte
+
+A raw block contains exactly token_count verbatim bytes. The encoder emits
+raw blocks whenever LZ77 would not make the block smaller, so an
+incompressible stream never grows beyond the framing overhead. In an LZ77
+block exactly token_count tokens are read; any padding bits that fill the
+final byte are ignored.
+
+A variable length unsigned integer is encoded in groups of 7 bits, low group
+first, each prefixed by a continuation bit (1 = another group follows).
+
+window_size and min_match must both be powers of two. window_size must be in
+the range 256..65536, min_match in the range 3..256, and min_match must not
+exceed window_size. Invalid parameters make the functions return NULL. */
+
+/* LZ77-encode size bytes from data using a sliding window of window_size
+bytes and a minimum match length of min_match. Returns a malloc'd buffer of
+*out_len bytes, or NULL on invalid parameters or malloc failure. */
+
+void *qoi_lz77_encode(const void *data, int size, int *out_len,
+	int window_size, int min_match);
+
+
+/* Invert qoi_lz77_encode. The window_size and min_match are read from the
+stream header and need not be supplied by the caller. Returns a malloc'd
+buffer of *out_len bytes, or NULL on invalid parameters, malformed data or
+malloc failure. */
+
+void *qoi_lz77_decode(const void *data, int size, int *out_len);
+
+
 #ifdef __cplusplus
 }
 #endif
@@ -646,4 +699,518 @@ void *qoi_read(const char *filename, qoi_desc *desc, int channels) {
 }
 
 #endif /* QOI_NO_STDIO */
+
+
+/* -----------------------------------------------------------------------------
+LZ77 layer - self-contained, no third party code. See the documentation above
+the qoi_lz77_encode() declaration for the stream format. */
+
+#define QOLZ_MAGIC \
+	(((unsigned int)'q') << 24 | ((unsigned int)'o') << 16 | \
+	 ((unsigned int)'l') <<  8 | ((unsigned int)'z'))
+#define QOLZ_HEADER_SIZE    12
+#define QOLZ_BLOCK_HDR_SIZE 8
+#define QOLZ_BLOCK_MAX      (16 * 1024 * 1024)
+#define QOLZ_BLOCK_LZ77     0
+#define QOLZ_BLOCK_RAW      1
+#define QOLZ_MATCH_MAX      65535
+#define QOLZ_HASH_LOG       16
+#define QOLZ_HASH_SIZE      (1 << QOLZ_HASH_LOG)
+#define QOLZ_CHAIN_MAX      32
+
+typedef struct {
+	unsigned char *data;
+	int cap;
+	int pos;       /* bytes flushed */
+	unsigned int acc;
+	int nbits;
+} qolz_writer_t;
+
+typedef struct {
+	const unsigned char *data;
+	int size;
+	int pos;
+	unsigned int acc;
+	int nbits;
+} qolz_reader_t;
+
+static int qolz_is_pow2(int v) {
+	return v > 0 && (v & (v - 1)) == 0;
+}
+
+/* Exact log2 of a power of two; undefined for other values (callers
+validate with qolz_is_pow2 first). */
+static int qolz_log2(int v) {
+	int log = 0;
+	while (v > 1) {
+		v >>= 1;
+		log++;
+	}
+	return log;
+}
+
+/* Finalize one block at out[start]: write the 8 byte header (token count
+with the block-type flag in the high bit, payload length) and the payload.
+An LZ77 payload is taken from lz/lz_len; when it is not strictly smaller
+than the raw input, the verbatim bytes src[src_off .. src_off+in_len) are
+stored in a raw block instead. Returns the number of bytes the block
+occupies, or 0 on failure. */
+static int qolz_write_block(unsigned char *out, int start, int cap,
+	const unsigned char *src, int src_off, int in_len,
+	int token_count, const unsigned char *lz, int lz_len) {
+	int use_raw = (in_len == 0) || (lz_len >= in_len);
+	int type = use_raw ? QOLZ_BLOCK_RAW : QOLZ_BLOCK_LZ77;
+	int count = use_raw ? in_len : token_count;
+	int payload_len = use_raw ? in_len : lz_len;
+	unsigned int header_word =
+		(unsigned int)count | (type ? 0x80000000u : 0u);
+
+	if (start + QOLZ_BLOCK_HDR_SIZE + payload_len > cap ||
+		payload_len > QOLZ_BLOCK_MAX || count < 0) {
+		return 0;
+	}
+
+	out[start + 0] = (unsigned char)((header_word >> 24) & 0xff);
+	out[start + 1] = (unsigned char)((header_word >> 16) & 0xff);
+	out[start + 2] = (unsigned char)((header_word >>  8) & 0xff);
+	out[start + 3] = (unsigned char)(header_word & 0xff);
+	out[start + 4] = (unsigned char)((payload_len >> 24) & 0xff);
+	out[start + 5] = (unsigned char)((payload_len >> 16) & 0xff);
+	out[start + 6] = (unsigned char)((payload_len >>  8) & 0xff);
+	out[start + 7] = (unsigned char)(payload_len & 0xff);
+
+	if (use_raw) {
+		memcpy(out + start + QOLZ_BLOCK_HDR_SIZE,
+			src + src_off, (size_t)in_len);
+	}
+	else {
+		memcpy(out + start + QOLZ_BLOCK_HDR_SIZE,
+			lz, (size_t)lz_len);
+	}
+	return QOLZ_BLOCK_HDR_SIZE + payload_len;
+}
+
+static void qolz_writer_init(qolz_writer_t *w, void *data, int cap) {
+	w->data = (unsigned char *)data;
+	w->cap = cap;
+	w->pos = 0;
+	w->acc = 0;
+	w->nbits = 0;
+}
+
+static void qolz_put(qolz_writer_t *w, unsigned int value, int nbits) {
+	w->acc |= (value & ((1u << nbits) - 1)) << w->nbits;
+	w->nbits += nbits;
+	while (w->nbits >= 8) {
+		w->data[w->pos++] = (unsigned char)(w->acc & 0xff);
+		w->acc >>= 8;
+		w->nbits -= 8;
+	}
+}
+
+static void qolz_flush(qolz_writer_t *w) {
+	while (w->nbits > 0) {
+		w->data[w->pos++] = (unsigned char)(w->acc & 0xff);
+		w->acc >>= 8;
+		w->nbits -= 8;
+	}
+	w->acc = 0;
+	w->nbits = 0;
+}
+
+static void qolz_put_varuint(qolz_writer_t *w, unsigned int value) {
+	do {
+		unsigned int group = value & 0x7f;
+		value >>= 7;
+		qolz_put(w, group | (value ? 0x80 : 0x00), 8);
+	} while (value);
+}
+
+static int qolz_reader_init(qolz_reader_t *r, const void *data, int size) {
+	if (size < 0) {
+		return 0;
+	}
+	r->data = (const unsigned char *)data;
+	r->size = size;
+	r->pos = 0;
+	r->acc = 0;
+	r->nbits = 0;
+	return 1;
+}
+
+/* Read nbits bits. Returns 0 when the buffered stream does not hold enough
+bits. Block headers state the exact token count, so padding bits in the
+final byte are never requested. */
+static int qolz_get(qolz_reader_t *r, unsigned int *out, int nbits) {
+	unsigned int value = 0;
+	int got = 0;
+	while (got < nbits) {
+		int take;
+		if (r->nbits == 0) {
+			if (r->pos >= r->size) {
+				return 0;
+			}
+			r->acc = r->data[r->pos++];
+			r->nbits = 8;
+		}
+		take = r->nbits;
+		if (take > nbits - got) {
+			take = nbits - got;
+		}
+		value |= (r->acc & ((1u << take) - 1)) << got;
+		r->acc >>= take;
+		r->nbits -= take;
+		got += take;
+	}
+	*out = value;
+	return 1;
+}
+
+static int qolz_get_varuint(qolz_reader_t *r, unsigned int *out) {
+	unsigned int value = 0;
+	int shift = 0;
+	unsigned int byte;
+	do {
+		if (shift > 28 || !qolz_get(r, &byte, 8)) {
+			return 0;
+		}
+		value |= (byte & 0x7f) << shift;
+		shift += 7;
+	} while (byte & 0x80);
+	*out = value;
+	return 1;
+}
+
+void *qoi_lz77_encode(const void *data, int size, int *out_len,
+	int window_size, int min_match) {
+	const unsigned char *src;
+	unsigned char *out;
+	int *chain;
+	int head[QOLZ_HASH_SIZE];
+	int out_cap, out_pos, block_start, block_tokens;
+	int block_in_pos;
+	int pos, i;
+	qolz_writer_t w;
+
+	if (
+		data == NULL || out_len == NULL || size < 0 ||
+		!qolz_is_pow2(window_size) || window_size < 256 ||
+		window_size > 65536 ||
+		!qolz_is_pow2(min_match) || min_match < 3 || min_match > 256 ||
+		min_match > window_size
+	) {
+		return NULL;
+	}
+
+	/* chain[] is indexed by byte position, so it needs one slot per
+	input byte. head[] maps a hash to the most recent position. */
+	chain = (int *) QOI_MALLOC((size_t)(size > 0 ? size : 1) * sizeof(int));
+	if (!chain) {
+		return NULL;
+	}
+
+	/* Worst case: header + one block header per block + 9 bits per byte,
+	rounded up generously. A block holds at most QOLZ_BLOCK_MAX payload
+	bytes, so the number of blocks is bounded. */
+	out_cap = QOLZ_HEADER_SIZE + QOLZ_BLOCK_HDR_SIZE +
+		(size > 0 ? (int)(((long long)size * 9 + 7) / 8) + 64 : 0) +
+		(int)(((long long)size * 9 / (8LL * QOLZ_BLOCK_MAX) + 1) *
+			QOLZ_BLOCK_HDR_SIZE);
+	out = (unsigned char *) QOI_MALLOC((size_t)out_cap);
+	if (!out) {
+		QOI_FREE(chain);
+		return NULL;
+	}
+
+	for (i = 0; i < QOLZ_HASH_SIZE; i++) {
+		head[i] = -1;
+	}
+
+	src = (const unsigned char *)data;
+	out_pos = 0;
+
+	qoi_write_32(out, &out_pos, QOLZ_MAGIC);
+	out[out_pos++] = (unsigned char)qolz_log2(window_size);
+	out[out_pos++] = (unsigned char)qolz_log2(min_match);
+	out[out_pos++] = 0; /* reserved */
+	out[out_pos++] = 0;
+	qoi_write_32(out, &out_pos, (unsigned int)size);
+
+	block_start = out_pos;
+	out_pos += QOLZ_BLOCK_HDR_SIZE; /* backpatched later */
+	block_tokens = 0;
+	block_in_pos = 0;
+	qolz_writer_init(&w, out + out_pos, out_cap - out_pos);
+	pos = 0;
+	while (pos < size) {
+		unsigned int h = 0;
+		int candidate, probes, best_len = 0, best_dist = 0;
+		int match_len;
+
+		if (size - pos >= min_match) {
+			int limit = pos - window_size;
+			if (limit < 0) {
+				limit = 0;
+			}
+
+			h = (unsigned int)src[pos] * 2654435761u;
+			h ^= (unsigned int)src[pos + 1] * 2246822519u;
+			h ^= (unsigned int)src[pos + 2] * 3266489917u;
+			h &= (QOLZ_HASH_SIZE - 1);
+
+			candidate = head[h];
+			for (probes = 0;
+				candidate >= limit && probes < QOLZ_CHAIN_MAX;
+				probes++
+			) {
+				int len = 0;
+				int max_len = size - pos;
+				if (max_len > QOLZ_MATCH_MAX) {
+					max_len = QOLZ_MATCH_MAX;
+				}
+				while (
+					len < max_len &&
+					src[candidate + len] == src[pos + len]
+				) {
+					len++;
+				}
+				if (len > best_len) {
+					best_len = len;
+					best_dist = pos - candidate;
+					if (len == max_len) {
+						break;
+					}
+				}
+				if (candidate == 0 || chain[candidate] >= candidate) {
+					break;
+				}
+				candidate = chain[candidate];
+			}
+		}
+
+		if (best_len >= min_match) {
+			match_len = best_len;
+			block_tokens++;
+			qolz_put(&w, 1, 1);
+			qolz_put_varuint(&w, (unsigned int)(match_len - min_match));
+			qolz_put_varuint(&w, (unsigned int)(best_dist - 1));
+
+			/* Insert every position covered by the match so matches
+			starting inside the run remain findable. */
+			{
+				int end = pos + match_len;
+				int j;
+				for (j = pos; j < end && j < size; j++) {
+					unsigned int hj;
+					if (size - j < 3) {
+						break;
+					}
+					hj = (unsigned int)src[j] * 2654435761u;
+					hj ^= (unsigned int)src[j + 1] * 2246822519u;
+					hj ^= (unsigned int)src[j + 2] * 3266489917u;
+					hj &= (QOLZ_HASH_SIZE - 1);
+					chain[j] = head[hj];
+					head[hj] = j;
+				}
+			}
+			pos += match_len;
+		}
+		else {
+			block_tokens++;
+			qolz_put(&w, 0, 1);
+			qolz_put(&w, src[pos], 8);
+			if (size - pos >= 3) {
+				chain[pos] = head[h];
+				head[h] = pos;
+			}
+			pos++;
+		}
+
+		/* Flush a block before it can exceed QOLZ_BLOCK_MAX input
+		bytes. */
+		if (pos - block_in_pos >= QOLZ_BLOCK_MAX && pos < size) {
+			int written;
+			qolz_flush(&w);
+			written = qolz_write_block(out, block_start, out_cap,
+				src, block_in_pos, pos - block_in_pos,
+				block_tokens, w.data, w.pos);
+			if (!written) {
+				QOI_FREE(chain);
+				QOI_FREE(out);
+				return NULL;
+			}
+			out_pos = block_start + written;
+			block_start = out_pos;
+			out_pos += QOLZ_BLOCK_HDR_SIZE;
+			block_tokens = 0;
+			block_in_pos = pos;
+			qolz_writer_init(&w, out + out_pos, out_cap - out_pos);
+		}
+	}
+
+	qolz_flush(&w);
+	{
+		int written = qolz_write_block(out, block_start, out_cap,
+			src, block_in_pos, size - block_in_pos,
+			block_tokens, w.data, w.pos);
+		if (!written) {
+			QOI_FREE(chain);
+			QOI_FREE(out);
+			return NULL;
+		}
+		out_pos = block_start + written;
+	}
+
+	QOI_FREE(chain);
+	*out_len = out_pos;
+	return out;
+}
+
+void *qoi_lz77_decode(const void *data, int size, int *out_len) {
+	const unsigned char *src;
+	unsigned char *out;
+	int window_size, min_match;
+	int p = 0, out_cap, out_pos = 0;
+
+	if (data == NULL || out_len == NULL ||
+		size < QOLZ_HEADER_SIZE + QOLZ_BLOCK_HDR_SIZE) {
+		return NULL;
+	}
+
+	src = (const unsigned char *)data;
+
+	if (qoi_read_32(src, &p) != QOLZ_MAGIC) {
+		return NULL;
+	}
+	/* Reject exponents that could not have passed the encoder's
+	validation before doing the shift. */
+	if (src[4] < 8 || src[4] > 16 || src[5] < 2 || src[5] > 8 ||
+		src[5] > src[4]) {
+		return NULL;
+	}
+	window_size = 1 << src[p++];
+	min_match = 1 << src[p++];
+	p += 2; /* reserved bytes */
+	{
+		unsigned int original_size = qoi_read_32(src, &p);
+		if (original_size > (unsigned int)0x7fffffff) {
+			return NULL;
+		}
+		out_cap = (int)original_size;
+	}
+
+	if (
+		!qolz_is_pow2(window_size) || window_size < 256 ||
+		window_size > 65536 ||
+		!qolz_is_pow2(min_match) || min_match < 3 || min_match > 256 ||
+		min_match > window_size
+	) {
+		return NULL;
+	}
+
+	out = (unsigned char *) QOI_MALLOC((size_t)out_cap ? (size_t)out_cap : 1);
+	if (!out) {
+		return NULL;
+	}
+
+	while (p < size) {
+		int block_type;
+		unsigned int token_count, payload_len;
+		qolz_reader_t r;
+		unsigned int flag;
+		unsigned int token;
+
+		if (p + QOLZ_BLOCK_HDR_SIZE > size) {
+			goto fail;
+		}
+		{
+			unsigned int hword =
+				((unsigned int)src[p] << 24) |
+				((unsigned int)src[p + 1] << 16) |
+				((unsigned int)src[p + 2] << 8) |
+				(unsigned int)src[p + 3];
+			payload_len =
+				((unsigned int)src[p + 4] << 24) |
+				((unsigned int)src[p + 5] << 16) |
+				((unsigned int)src[p + 6] << 8) |
+				(unsigned int)src[p + 7];
+			block_type = (int)((hword >> 31) & 1u);
+			token_count = hword & 0x7fffffffu;
+		}
+		p += QOLZ_BLOCK_HDR_SIZE;
+
+		if ((long long)p + (long long)payload_len > (long long)size ||
+			(block_type != QOLZ_BLOCK_LZ77 &&
+				block_type != QOLZ_BLOCK_RAW)) {
+			goto fail;
+		}
+
+		if (block_type == QOLZ_BLOCK_RAW) {
+			/* Verbatim bytes: count and payload length are equal. */
+			if (token_count != payload_len ||
+				(long long)out_pos + (long long)payload_len >
+					(long long)out_cap) {
+				goto fail;
+			}
+			memcpy(out + out_pos, src + p, payload_len);
+			out_pos += (int)payload_len;
+			p += (int)payload_len;
+			continue;
+		}
+
+		if (!qolz_reader_init(&r, src + p, (int)payload_len)) {
+			goto fail;
+		}
+		p += (int)payload_len;
+
+		/* Read exactly token_count tokens; padding bits in the final
+		byte are never touched. */
+		for (token = 0; token < token_count; token++) {
+			if (!qolz_get(&r, &flag, 1)) {
+				goto fail;
+			}
+			if (flag == 0) {
+				unsigned int value;
+				if (!qolz_get(&r, &value, 8) ||
+					out_pos >= out_cap) {
+					goto fail;
+				}
+				out[out_pos++] = (unsigned char)value;
+			}
+			else {
+				unsigned int len_extra, dist_m1;
+				int match_len, distance, start, k;
+				if (!qolz_get_varuint(&r, &len_extra) ||
+					!qolz_get_varuint(&r, &dist_m1)) {
+					goto fail;
+				}
+				match_len = (int)len_extra + min_match;
+				distance = (int)dist_m1 + 1;
+				if (match_len > QOLZ_MATCH_MAX ||
+					distance > window_size ||
+					distance > out_pos ||
+					match_len > out_cap - out_pos) {
+					goto fail;
+				}
+				/* Byte-wise copy: overlapping matches (distance <
+				match_len) must repeat the earlier bytes. */
+				start = out_pos - distance;
+				for (k = 0; k < match_len; k++) {
+					out[out_pos++] = out[start + k];
+				}
+			}
+		}
+	}
+
+	if (out_pos != out_cap) {
+		goto fail;
+	}
+
+	*out_len = out_pos;
+	return out;
+
+fail:
+	QOI_FREE(out);
+	return NULL;
+}
 #endif /* QOI_IMPLEMENTATION */
