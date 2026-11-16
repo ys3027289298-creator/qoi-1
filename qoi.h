@@ -278,6 +278,30 @@ The returned qoi data should be free()d after use. */
 void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len);
 
 
+/* Parallel variant of qoi_encode().
+
+Splits the image into `threads` contiguous row bands, encodes the bands on
+independent threads and merges their output into a single QOI stream. The
+merged result is byte-for-byte identical to qoi_encode() with the same
+arguments. A serial state scan computes the encoder state (color index,
+previous pixel, open run) at the start of each band, so every band encodes
+exactly as the single-threaded encoder would at that position.
+
+`threads` must be in the range [1, QOI_PARALLEL_THREADS_MAX]. Values outside
+this range make the function return NULL. If `threads` exceeds the image
+height it is silently clamped to the height (each thread gets at least one
+row). threads == 1 is equivalent to calling qoi_encode() directly.
+
+The function either returns NULL on failure (invalid parameters, malloc
+failure or inability to spawn a thread) or a pointer to the encoded data on
+success, in which case *out_len holds its size. The returned data should be
+free()d after use. */
+
+#define QOI_PARALLEL_THREADS_MAX 64
+
+void *qoi_encode_parallel(const void *data, const qoi_desc *desc, int *out_len, int threads);
+
+
 /* Decode a QOI image from memory.
 
 The function either returns NULL on failure (invalid parameters or malloc
@@ -482,6 +506,341 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	}
 
 	*out_len = p;
+	return bytes;
+}
+
+/* -----------------------------------------------------------------------------
+Parallel encoding
+
+The QOI encoder state is fully described by the color index[64], the previous
+pixel and the open run length. A serial state scan over all pixels snapshots
+this state at the start of every row band. Each band can then be encoded
+independently, starting from its snapshot, producing exactly the bytes the
+single-threaded encoder would emit for that pixel range. Bands never flush a
+run at their end (only a run of 62 or the global last pixel flushes), so open
+runs carry across band boundaries exactly as they do in qoi_encode(). */
+
+#if !defined(QOI_NO_PTHREAD) && (defined(__linux__) || defined(__APPLE__) || defined(__unix__))
+	#define QOI_HAVE_PTHREAD 1
+	#include <pthread.h>
+#endif
+
+typedef struct {
+	qoi_rgba_t index[64];
+	qoi_rgba_t px_prev;
+	int run;
+} qoi_enc_state_t;
+
+typedef struct {
+	const unsigned char *pixels;
+	int channels;
+	int start_pos;		/* byte offset of the band's first pixel */
+	int px_count;		/* number of pixels in this band */
+	int px_end;			/* global px_len - channels; only the last band hits it */
+	qoi_enc_state_t state;
+	unsigned char *bytes;
+	int size;
+} qoi_enc_band_t;
+
+static void *qoi_encode_band_worker(void *arg) {
+	qoi_enc_band_t *band = (qoi_enc_band_t *)arg;
+	const unsigned char *pixels = band->pixels;
+	int channels = band->channels;
+	int px_end = band->px_end;
+	qoi_rgba_t index[64];
+	qoi_rgba_t px, px_prev;
+	int run, p, i, end_pos;
+
+	memcpy(index, band->state.index, sizeof(index));
+	px_prev = band->state.px_prev;
+	run = band->state.run;
+	px = px_prev;
+	p = 0;
+
+	end_pos = band->start_pos + band->px_count * channels;
+	for (i = band->start_pos; i < end_pos; i += channels) {
+		px.rgba.r = pixels[i + 0];
+		px.rgba.g = pixels[i + 1];
+		px.rgba.b = pixels[i + 2];
+
+		if (channels == 4) {
+			px.rgba.a = pixels[i + 3];
+		}
+
+		if (px.v == px_prev.v) {
+			run++;
+			if (run == 62 || i == px_end) {
+				band->bytes[p++] = QOI_OP_RUN | (run - 1);
+				run = 0;
+			}
+		}
+		else {
+			int index_pos;
+
+			if (run > 0) {
+				band->bytes[p++] = QOI_OP_RUN | (run - 1);
+				run = 0;
+			}
+
+			index_pos = QOI_COLOR_HASH(px) & (64 - 1);
+
+			if (index[index_pos].v == px.v) {
+				band->bytes[p++] = QOI_OP_INDEX | index_pos;
+			}
+			else {
+				index[index_pos] = px;
+
+				if (px.rgba.a == px_prev.rgba.a) {
+					signed char vr = px.rgba.r - px_prev.rgba.r;
+					signed char vg = px.rgba.g - px_prev.rgba.g;
+					signed char vb = px.rgba.b - px_prev.rgba.b;
+
+					signed char vg_r = vr - vg;
+					signed char vg_b = vb - vg;
+
+					if (
+						vr > -3 && vr < 2 &&
+						vg > -3 && vg < 2 &&
+						vb > -3 && vb < 2
+					) {
+						band->bytes[p++] = QOI_OP_DIFF | (vr + 2) << 4 | (vg + 2) << 2 | (vb + 2);
+					}
+					else if (
+						vg_r >  -9 && vg_r <  8 &&
+						vg   > -33 && vg   < 32 &&
+						vg_b >  -9 && vg_b <  8
+					) {
+						band->bytes[p++] = QOI_OP_LUMA     | (vg   + 32);
+						band->bytes[p++] = (vg_r + 8) << 4 | (vg_b +  8);
+					}
+					else {
+						band->bytes[p++] = QOI_OP_RGB;
+						band->bytes[p++] = px.rgba.r;
+						band->bytes[p++] = px.rgba.g;
+						band->bytes[p++] = px.rgba.b;
+					}
+				}
+				else {
+					band->bytes[p++] = QOI_OP_RGBA;
+					band->bytes[p++] = px.rgba.r;
+					band->bytes[p++] = px.rgba.g;
+					band->bytes[p++] = px.rgba.b;
+					band->bytes[p++] = px.rgba.a;
+				}
+			}
+		}
+		px_prev = px;
+	}
+
+	band->size = p;
+	return NULL;
+}
+
+/* Serial pass over all pixels: mirrors qoi_encode()'s state transitions
+without emitting any bytes, and snapshots the state at each band start. */
+static void qoi_encode_state_scan(
+	const unsigned char *pixels, int px_len, int channels,
+	qoi_enc_band_t *bands, int band_count
+) {
+	qoi_rgba_t index[64];
+	qoi_rgba_t px, px_prev;
+	int run, px_pos, next_band;
+
+	QOI_ZEROARR(index);
+
+	run = 0;
+	px_prev.rgba.r = 0;
+	px_prev.rgba.g = 0;
+	px_prev.rgba.b = 0;
+	px_prev.rgba.a = 255;
+	px = px_prev;
+
+	next_band = 1;
+	memcpy(&bands[0].state.index, index, sizeof(index));
+	bands[0].state.px_prev = px_prev;
+	bands[0].state.run = run;
+
+	for (px_pos = 0; px_pos < px_len; px_pos += channels) {
+		if (next_band < band_count && px_pos == bands[next_band].start_pos) {
+			memcpy(&bands[next_band].state.index, index, sizeof(index));
+			bands[next_band].state.px_prev = px_prev;
+			bands[next_band].state.run = run;
+			next_band++;
+		}
+
+		px.rgba.r = pixels[px_pos + 0];
+		px.rgba.g = pixels[px_pos + 1];
+		px.rgba.b = pixels[px_pos + 2];
+
+		if (channels == 4) {
+			px.rgba.a = pixels[px_pos + 3];
+		}
+
+		if (px.v == px_prev.v) {
+			run++;
+			if (run == 62) {
+				run = 0;
+			}
+		}
+		else {
+			int index_pos;
+			run = 0;
+			index_pos = QOI_COLOR_HASH(px) & (64 - 1);
+			if (index[index_pos].v != px.v) {
+				index[index_pos] = px;
+			}
+		}
+		px_prev = px;
+	}
+}
+
+void *qoi_encode_parallel(const void *data, const qoi_desc *desc, int *out_len, int threads) {
+	int i, max_size, px_len, px_end, channels, width, height, used, band_count;
+	unsigned char *bytes;
+	const unsigned char *pixels;
+	qoi_enc_band_t *bands;
+#ifdef QOI_HAVE_PTHREAD
+	pthread_t thread_ids[QOI_PARALLEL_THREADS_MAX];
+	int threads_created = 0;
+#endif
+
+	if (
+		data == NULL || out_len == NULL || desc == NULL ||
+		desc->width == 0 || desc->height == 0 ||
+		desc->channels < 3 || desc->channels > 4 ||
+		desc->colorspace > 1 ||
+		desc->height >= QOI_PIXELS_MAX / desc->width
+	) {
+		return NULL;
+	}
+
+	if (threads < 1 || threads > QOI_PARALLEL_THREADS_MAX) {
+		return NULL;
+	}
+
+#ifndef QOI_HAVE_PTHREAD
+	/* No threading support available; the single-threaded encoder produces
+	identical output anyway. */
+	threads = 1;
+#endif
+
+	if (threads == 1) {
+		return qoi_encode(data, desc, out_len);
+	}
+
+	width = desc->width;
+	height = desc->height;
+	channels = desc->channels;
+	pixels = (const unsigned char *)data;
+
+	px_len = width * height * channels;
+	px_end = px_len - channels;
+
+	/* Never use more bands than rows; every band must cover at least one row. */
+	used = (threads > height) ? height : threads;
+	if (used == 1) {
+		return qoi_encode(data, desc, out_len);
+	}
+
+	bands = (qoi_enc_band_t *) QOI_MALLOC((size_t)used * sizeof(qoi_enc_band_t));
+	if (!bands) {
+		return NULL;
+	}
+	memset(bands, 0, (size_t)used * sizeof(qoi_enc_band_t));
+
+	for (i = 0; i < used; i++) {
+		int row_start = (int)(((long long)i * height) / used);
+		int row_end = (int)(((long long)(i + 1) * height) / used);
+
+		bands[i].pixels = pixels;
+		bands[i].channels = channels;
+		bands[i].start_pos = row_start * width * channels;
+		bands[i].px_count = (row_end - row_start) * width;
+		bands[i].px_end = px_end;
+	}
+	band_count = used;
+
+	qoi_encode_state_scan(pixels, px_len, channels, bands, band_count);
+
+	for (i = 0; i < band_count; i++) {
+		/* Worst case: channels + 1 bytes per pixel (QOI_OP_RGBA), plus one
+		extra byte in case a run open at the band's start is flushed by the
+		band's first differing pixel. */
+		int band_max = bands[i].px_count * (channels + 1) + 1;
+		bands[i].bytes = (unsigned char *) QOI_MALLOC(band_max);
+		if (!bands[i].bytes) {
+			int j;
+			for (j = 0; j < i; j++) {
+				QOI_FREE(bands[j].bytes);
+			}
+			QOI_FREE(bands);
+			return NULL;
+		}
+	}
+
+#ifdef QOI_HAVE_PTHREAD
+	for (i = 0; i < band_count; i++) {
+		int err = pthread_create(&thread_ids[i], NULL, qoi_encode_band_worker, &bands[i]);
+		if (err != 0) {
+			int j;
+			for (j = 0; j < threads_created; j++) {
+				pthread_join(thread_ids[j], NULL);
+			}
+			for (j = 0; j < band_count; j++) {
+				QOI_FREE(bands[j].bytes);
+			}
+			QOI_FREE(bands);
+			return NULL;
+		}
+		threads_created++;
+	}
+	for (i = 0; i < threads_created; i++) {
+		pthread_join(thread_ids[i], NULL);
+	}
+#else
+	for (i = 0; i < band_count; i++) {
+		qoi_encode_band_worker(&bands[i]);
+	}
+#endif
+
+	max_size = QOI_HEADER_SIZE;
+	for (i = 0; i < band_count; i++) {
+		max_size += bands[i].size;
+	}
+	max_size += (int)sizeof(qoi_padding);
+
+	bytes = (unsigned char *) QOI_MALLOC(max_size);
+	if (!bytes) {
+		for (i = 0; i < band_count; i++) {
+			QOI_FREE(bands[i].bytes);
+		}
+		QOI_FREE(bands);
+		return NULL;
+	}
+
+	/* Merge: one QOI header, all band streams in order, one end marker. */
+	i = 0;
+	qoi_write_32(bytes, &i, QOI_MAGIC);
+	qoi_write_32(bytes, &i, desc->width);
+	qoi_write_32(bytes, &i, desc->height);
+	bytes[i++] = desc->channels;
+	bytes[i++] = desc->colorspace;
+
+	{
+		int p = QOI_HEADER_SIZE;
+		int b;
+		for (b = 0; b < band_count; b++) {
+			memcpy(bytes + p, bands[b].bytes, bands[b].size);
+			p += bands[b].size;
+			QOI_FREE(bands[b].bytes);
+		}
+		for (b = 0; b < (int)sizeof(qoi_padding); b++) {
+			bytes[p++] = qoi_padding[b];
+		}
+		*out_len = p;
+	}
+
+	QOI_FREE(bands);
 	return bytes;
 }
 
