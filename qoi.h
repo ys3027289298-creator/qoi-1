@@ -45,6 +45,8 @@ This library provides the following functions;
 - qoi_decode  -- decode the raw bytes of a QOI image from memory
 - qoi_write   -- encode and write a QOI file
 - qoi_encode  -- encode an rgba buffer into a QOI image in memory
+- qoi_encode_rle -- run-length preprocess then encode (large flat areas)
+- qoi_decode_rle -- decode a run-length preprocessed stream
 
 See the function declaration below for the signature and more information.
 
@@ -287,6 +289,113 @@ is filled with the description from the file header.
 The returned pixel data should be free()d after use. */
 
 void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels);
+
+
+/* --- Run-length preprocessed streams ("qoir") ---
+
+QOI already has a run-length opcode, but it is limited to 62 pixels per
+chunk. Images with very large flat areas (pixel art, UI mockups, flat
+backgrounds) therefore spend one chunk on every 62 pixels of such an area.
+The run-length layer below replaces such an area with two token pixels
+before the regular QOI encoder is called.
+
+The preprocessor scans the input pixels in row-major order and finds every
+maximal run of identical pixels. A run is preprocessed when its length is
+strictly greater than `threshold`; it is then replaced by a run token.
+Every other pixel is copied as a literal token. The tokens are encoded with
+the unchanged qoi_encode() as an ordinary QOI image of four channels and
+height 1, so the original QOI bitstream format, the original encoder and
+the original decoder are not modified in any way. The regular QOI image is
+wrapped in a small header describing the original image and the threshold.
+
+`threshold` is the largest run length that is left for the regular QOI
+encoder. It must be at least 1 and at most QOI_RLE_MAX_THRESHOLD; any other
+value, including 0 and negative values, is invalid and makes
+qoi_encode_rle() fail.
+
+Stream layout (all multi-byte integers are big endian):
+
+	qoir header (20 bytes)
+		char     magic[4];    // "qoir"
+		uint32_t width;       // original image width in pixels
+		uint32_t height;      // original image height in pixels
+		uint8_t  channels;    // 3 = RGB, 4 = RGBA
+		uint8_t  colorspace;  // 0 = sRGB, 1 = linear (informative only)
+		uint16_t reserved;    // must be 0
+		uint32_t threshold;   // largest run length left to the QOI encoder
+
+	an ordinary QOI image ("qoif", 4 channels, "width" = token count,
+	height 1, same colorspace as the original image)
+
+Token pixels (r, g, b, a), read in this order:
+
+	(r, g, b, a) with a != 0    literal pixel, emitted once
+	(0, 0, 0, 0), (r, g, b, a)  escaped literal, emitted once
+	(L>>16, L>>8, L, 0), V      run token: V emitted L times
+
+A run token is a length pixel whose alpha byte is 0 and whose rgb bytes hold
+the 24 bit count L, immediately followed by the pixel value V to repeat. It
+costs two token pixels, i.e. a few bytes, no matter how long the run is. L
+is 1..0xFFFFFF; a longer run is split into consecutive run tokens with the
+same V.
+
+The encoding is unambiguous because of these rules, all of which the encoder
+applies:
+
+ - A literal pixel whose alpha byte is 0 can be confused with a length
+   pixel, so every such literal is escaped as (0,0,0,0) followed by the
+   literal itself. A literal (0,0,0,0) is therefore written as (0,0,0,0),
+   (0,0,0,0).
+ - A length pixel always has a non-zero rgb value, because L >= 1, so
+   (0,0,0,0) is never a length pixel. The decoder reads (0,0,0,0) as the
+   escape marker and the next token as a literal.
+ - A length pixel with non-zero rgb is always followed by a value pixel.
+   The value pixel is consumed by the run, even when it is (0,0,0,0), so it
+   can never be mistaken for an escape marker.
+
+For 3 channel input the alpha byte of every literal is forced to 255, so no
+escape is ever written and without long runs the token stream is exactly
+the pixel stream.
+
+qoi_decode_rle() reconstructs the exact original pixels. It returns NULL
+for malformed headers, invalid parameters, truncated or inconsistent token
+streams, and for streams whose expansion does not produce exactly
+width * height pixels. */
+
+#define QOI_RLE_MAGIC \
+	(((unsigned int)'q') << 24 | ((unsigned int)'o') << 16 | \
+	 ((unsigned int)'i') <<  8 | ((unsigned int)'r'))
+#define QOI_RLE_HEADER_SIZE 20
+#define QOI_RLE_MAX_RUN 0xFFFFFF
+#define QOI_RLE_MAX_THRESHOLD 400000000
+
+/* Encode raw RGB or RGBA pixels into a run-length preprocessed stream in
+memory. Runs longer than `threshold` pixels are replaced by a run token and
+the token stream is encoded with the regular QOI encoder.
+
+The function either returns NULL on failure (invalid parameters, an
+invalid threshold, or malloc failure) or a pointer to the encoded data on
+success. On success the out_len is set to the size in bytes of the encoded
+data.
+
+The returned data should be free()d after use. */
+
+void *qoi_encode_rle(const void *data, const qoi_desc *desc, int threshold,
+	int *out_len);
+
+
+/* Decode a run-length preprocessed stream produced by qoi_encode_rle()
+from memory. If channels is 0, the number of channels from the stream
+header is used. If channels is 3 or 4 the output format will be forced
+into this number of channels.
+
+The function either returns NULL on failure (invalid data or malloc
+failed) or a pointer to the decoded pixels. On success, the qoi_desc struct
+is filled with the description from the stream header.
+
+The returned pixel data should be free()d after use. */
+
+void *qoi_decode_rle(const void *data, int size, qoi_desc *desc, int channels);
 
 
 #ifdef __cplusplus
@@ -585,6 +694,391 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 			pixels[px_pos + 3] = px.rgba.a;
 		}
 	}
+
+	return pixels;
+}
+
+/* -----------------------------------------------------------------------------
+Run-length preprocessing layer ("qoir") */
+
+/* Return 1 if the pixel at px_pos equals the pixel at other_pos. */
+static int qoi_rle_pixel_eq(
+	const unsigned char *pixels, int px_pos, int other_pos, int channels
+) {
+	int c;
+	for (c = 0; c < channels; c++) {
+		if (pixels[px_pos + c] != pixels[other_pos + c]) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+/* Append one token pixel and advance the token position. */
+static void qoi_rle_put(unsigned char *tokens, int *t,
+	unsigned char r, unsigned char g, unsigned char b, unsigned char a
+) {
+	tokens[(*t)++] = r;
+	tokens[(*t)++] = g;
+	tokens[(*t)++] = b;
+	tokens[(*t)++] = a;
+}
+
+/* Return 1 if a literal pixel has to be escaped, i.e. its alpha byte is 0
+and would otherwise be read as a run length pixel. */
+static int qoi_rle_needs_escape(const unsigned char *p, int channels) {
+	return channels == 4 && p[3] == 0;
+}
+
+/* Append one literal pixel, escaping it when its alpha byte is 0. */
+static void qoi_rle_put_literal(unsigned char *tokens, int *t,
+	const unsigned char *p, int channels
+) {
+	unsigned char a = channels == 4 ? p[3] : 255;
+
+	if (channels == 4 && p[3] == 0) {
+		qoi_rle_put(tokens, t, 0, 0, 0, 0);
+	}
+	qoi_rle_put(tokens, t, p[0], p[1], p[2], a);
+}
+
+void *qoi_encode_rle(const void *data, const qoi_desc *desc, int threshold,
+	int *out_len
+) {
+	const unsigned char *pixels;
+	unsigned char *tokens, *bytes;
+	qoi_desc token_desc;
+	int width, height, channels, px_count, px_pos, run_len;
+	int token_count, t, segments, seg, seg_len, remaining;
+	int inner_len = 0;
+	void *inner;
+
+	if (
+		data == NULL || out_len == NULL || desc == NULL ||
+		desc->width == 0 || desc->height == 0 ||
+		desc->channels < 3 || desc->channels > 4 ||
+		desc->colorspace > 1 ||
+		desc->height >= QOI_PIXELS_MAX / desc->width ||
+		threshold < 1 || threshold > QOI_RLE_MAX_THRESHOLD
+	) {
+		return NULL;
+	}
+
+	pixels = (const unsigned char *)data;
+	width = (int)desc->width;
+	height = (int)desc->height;
+	channels = desc->channels;
+	px_count = width * height;
+
+	/* First pass: count the tokens. A preprocessed run costs two tokens
+	per QOI_RLE_MAX_RUN segment (length and value); every other pixel costs
+	one token, or two when it has to be escaped. */
+	token_count = 0;
+	px_pos = 0;
+	while (px_pos < px_count) {
+		int base = px_pos * channels;
+
+		run_len = 1;
+		while (
+			px_pos + run_len < px_count &&
+			qoi_rle_pixel_eq(pixels, (px_pos + run_len) * channels,
+				base, channels)
+		) {
+			run_len++;
+		}
+
+		if (run_len > threshold) {
+			segments = (run_len + QOI_RLE_MAX_RUN - 1) / QOI_RLE_MAX_RUN;
+			token_count += segments * 2;
+		}
+		else {
+			int k;
+			for (k = 0; k < run_len; k++) {
+				token_count += qoi_rle_needs_escape(
+					pixels + (size_t)(px_pos + k) * channels,
+					channels) ? 2 : 1;
+			}
+		}
+
+		px_pos += run_len;
+	}
+
+	/* The tokens are stored as an ordinary QOI image, one token per pixel,
+	so they inherit QOI's pixel limit. */
+	if (token_count < 1 || token_count >= (int)QOI_PIXELS_MAX) {
+		return NULL;
+	}
+
+	tokens = (unsigned char *) QOI_MALLOC((size_t)token_count * 4);
+	if (!tokens) {
+		return NULL;
+	}
+
+	/* Second pass: emit the tokens. */
+	t = 0;
+	px_pos = 0;
+	while (px_pos < px_count) {
+		int base = px_pos * channels;
+
+		run_len = 1;
+		while (
+			px_pos + run_len < px_count &&
+			qoi_rle_pixel_eq(pixels, (px_pos + run_len) * channels,
+				base, channels)
+		) {
+			run_len++;
+		}
+
+		if (run_len > threshold) {
+			remaining = run_len;
+			segments = (run_len + QOI_RLE_MAX_RUN - 1) / QOI_RLE_MAX_RUN;
+			for (seg = 0; seg < segments; seg++) {
+				seg_len = remaining > QOI_RLE_MAX_RUN
+					? QOI_RLE_MAX_RUN : remaining;
+
+				/* Length pixel (alpha 0, 24 bit count in rgb) followed
+				by the pixel value to repeat. */
+				qoi_rle_put(tokens, &t,
+					(unsigned char)((seg_len >> 16) & 0xff),
+					(unsigned char)((seg_len >>  8) & 0xff),
+					(unsigned char)( seg_len        & 0xff), 0);
+				qoi_rle_put(tokens, &t,
+					pixels[base + 0], pixels[base + 1],
+					pixels[base + 2],
+					channels == 4 ? pixels[base + 3] : 255);
+
+				remaining -= seg_len;
+			}
+		}
+		else {
+			int k;
+			for (k = 0; k < run_len; k++) {
+				qoi_rle_put_literal(tokens, &t,
+					pixels + (size_t)(px_pos + k) * channels, channels);
+			}
+		}
+
+		px_pos += run_len;
+	}
+
+	/* The token stream is encoded with the unmodified QOI encoder. */
+	token_desc.width = (unsigned int)token_count;
+	token_desc.height = 1;
+	token_desc.channels = 4;
+	token_desc.colorspace = desc->colorspace;
+
+	inner = qoi_encode(tokens, &token_desc, &inner_len);
+	QOI_FREE(tokens);
+	if (!inner) {
+		return NULL;
+	}
+
+	bytes = (unsigned char *) QOI_MALLOC(
+		(size_t)QOI_RLE_HEADER_SIZE + (size_t)inner_len
+	);
+	if (!bytes) {
+		QOI_FREE(inner);
+		return NULL;
+	}
+
+	t = 0;
+	qoi_write_32(bytes, &t, QOI_RLE_MAGIC);
+	qoi_write_32(bytes, &t, desc->width);
+	qoi_write_32(bytes, &t, desc->height);
+	bytes[t++] = desc->channels;
+	bytes[t++] = desc->colorspace;
+	bytes[t++] = 0;
+	bytes[t++] = 0;
+	qoi_write_32(bytes, &t, (unsigned int)threshold);
+
+	memcpy(bytes + t, inner, (size_t)inner_len);
+	t += inner_len;
+
+	QOI_FREE(inner);
+
+	*out_len = t;
+	return bytes;
+}
+
+void *qoi_decode_rle(const void *data, int size, qoi_desc *desc, int channels) {
+	const unsigned char *bytes, *tokens;
+	unsigned char *pixels;
+	qoi_desc inner_desc;
+	unsigned int width, height, threshold;
+	unsigned char src_channels, colorspace;
+	int p, px_total, out_channels, ti, token_count, out_pos;
+	void *inner_pixels;
+
+	if (
+		data == NULL || desc == NULL ||
+		(channels != 0 && channels != 3 && channels != 4) ||
+		size < QOI_RLE_HEADER_SIZE + QOI_HEADER_SIZE + (int)sizeof(qoi_padding)
+	) {
+		return NULL;
+	}
+
+	bytes = (const unsigned char *)data;
+	p = 0;
+
+	if (
+		qoi_read_32(bytes, &p) != QOI_RLE_MAGIC ||
+		(width = qoi_read_32(bytes, &p)) == 0 ||
+		(height = qoi_read_32(bytes, &p)) == 0 ||
+		(src_channels = bytes[p++]) < 3 || src_channels > 4 ||
+		((colorspace = bytes[p++]) > 1) ||
+		bytes[p++] != 0 || bytes[p++] != 0 ||
+		(threshold = qoi_read_32(bytes, &p)) < 1 ||
+		threshold > (unsigned int)QOI_RLE_MAX_THRESHOLD
+	) {
+		return NULL;
+	}
+
+	if (height >= QOI_PIXELS_MAX / width) {
+		return NULL;
+	}
+	px_total = (int)(width * height);
+
+	inner_pixels = qoi_decode(bytes + QOI_RLE_HEADER_SIZE,
+		size - QOI_RLE_HEADER_SIZE, &inner_desc, 4);
+	if (!inner_pixels) {
+		return NULL;
+	}
+
+	/* Only the four channel token form is valid: one token per pixel. */
+	if (
+		inner_desc.channels != 4 ||
+		inner_desc.height != 1 ||
+		inner_desc.width > (unsigned int)QOI_PIXELS_MAX ||
+		inner_desc.width * inner_desc.height >= QOI_PIXELS_MAX
+	) {
+		QOI_FREE(inner_pixels);
+		return NULL;
+	}
+	token_count = (int)(inner_desc.width * inner_desc.height);
+
+	out_channels = channels == 0 ? src_channels : channels;
+	pixels = (unsigned char *) QOI_MALLOC(
+		(size_t)px_total * (size_t)out_channels
+	);
+	if (!pixels) {
+		QOI_FREE(inner_pixels);
+		return NULL;
+	}
+
+	tokens = (const unsigned char *)inner_pixels;
+
+	/* Expand the token stream. A token with alpha 0 is the escape marker
+	(0,0,0,0) or a run length; every other token is a literal. */
+	ti = 0;
+	out_pos = 0;
+	while (ti < token_count) {
+		const unsigned char *tok = tokens + (size_t)ti * 4;
+		unsigned char r, g, b, a;
+
+		if (tok[3] == 0 && tok[0] == 0 && tok[1] == 0 && tok[2] == 0) {
+			/* Escape marker: the next token is a literal. */
+			if (ti + 1 >= token_count) {
+				QOI_FREE(inner_pixels);
+				QOI_FREE(pixels);
+				return NULL;
+			}
+			tok = tokens + (size_t)(ti + 1) * 4;
+			r = tok[0];
+			g = tok[1];
+			b = tok[2];
+			a = src_channels == 4 ? tok[3] : 255;
+			ti += 2;
+
+			if (out_pos >= px_total) {
+				QOI_FREE(inner_pixels);
+				QOI_FREE(pixels);
+				return NULL;
+			}
+			{
+				unsigned char *dst =
+					pixels + (size_t)out_pos * out_channels;
+
+				dst[0] = r;
+				dst[1] = g;
+				dst[2] = b;
+				if (out_channels == 4) {
+					dst[3] = a;
+				}
+				out_pos++;
+			}
+		}
+		else if (tok[3] == 0) {
+			/* Run length, followed by the pixel value to repeat. */
+			unsigned int run;
+
+			if (ti + 1 >= token_count) {
+				QOI_FREE(inner_pixels);
+				QOI_FREE(pixels);
+				return NULL;
+			}
+			run = ((unsigned int)tok[0] << 16) |
+				((unsigned int)tok[1] << 8) | (unsigned int)tok[2];
+			if (run < 1 || run > (unsigned int)(px_total - out_pos)) {
+				QOI_FREE(inner_pixels);
+				QOI_FREE(pixels);
+				return NULL;
+			}
+
+			tok = tokens + (size_t)(ti + 1) * 4;
+			r = tok[0];
+			g = tok[1];
+			b = tok[2];
+			a = src_channels == 4 ? tok[3] : 255;
+			ti += 2;
+
+			while (run-- > 0) {
+				unsigned char *dst =
+					pixels + (size_t)out_pos * out_channels;
+
+				dst[0] = r;
+				dst[1] = g;
+				dst[2] = b;
+				if (out_channels == 4) {
+					dst[3] = a;
+				}
+				out_pos++;
+			}
+		}
+		else {
+			/* Literal pixel. */
+			if (out_pos >= px_total) {
+				QOI_FREE(inner_pixels);
+				QOI_FREE(pixels);
+				return NULL;
+			}
+			{
+				unsigned char *dst =
+					pixels + (size_t)out_pos * out_channels;
+
+				dst[0] = tok[0];
+				dst[1] = tok[1];
+				dst[2] = tok[2];
+				if (out_channels == 4) {
+					dst[3] = tok[3];
+				}
+				out_pos++;
+			}
+			ti++;
+		}
+	}
+
+	QOI_FREE(inner_pixels);
+
+	/* The token stream has to describe the image exactly. */
+	if (out_pos != px_total) {
+		QOI_FREE(pixels);
+		return NULL;
+	}
+
+	desc->width = width;
+	desc->height = height;
+	desc->channels = src_channels;
+	desc->colorspace = colorspace;
 
 	return pixels;
 }
