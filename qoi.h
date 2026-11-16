@@ -205,6 +205,38 @@ The alpha value remains unchanged from the previous pixel.
 8-bit  blue channel value
 8-bit alpha channel value
 
+
+-- 16-bit extension (QOI16)
+
+Files with 16 bits per channel use a different magic and a 16 byte header,
+so classic 8-bit decoders reject them on the magic bytes alone:
+
+struct qoi16_header_t {
+	char     magic[4];   // magic bytes "qoiF"
+	uint32_t width;      // image width in pixels (BE)
+	uint32_t height;     // image height in pixels (BE)
+	uint8_t  channels;   // 1 = gray, 2 = gray+alpha, 3 = RGB, 4 = RGBA
+	uint8_t  colorspace; // 0 = sRGB with linear alpha, 1 = all linear
+	uint8_t  flags;      // must be QOI16_FLAGS (0x01)
+	uint8_t  bitdepth;   // must be 16
+};
+
+The chunk stream uses the same tags as the 8-bit format, but all color
+arithmetic (the running index hash and the DIFF/LUMA difference prediction)
+is performed on 16-bit channel values with 16-bit wraparound, and the raw
+channel values of QOI_OP_RGB/QOI_OP_RGBA chunks are written as big-endian
+16-bit integers. QOI_OP_RGB carries one 16-bit sample for grayscale images
+(channels 1 or 2) and three for RGB(A); QOI_OP_RGBA additionally carries the
+alpha sample. The initial pixel value is {r:0, g:0, b:0, a:65535}; grayscale
+pixels are internally treated as r=g=b.
+
+To request 16-bit encoding, OR QOI_16BIT into qoi_desc.colorspace and pass
+host-endian uint16 samples (width*height*channels of them) as the pixel data.
+When qoi_decode/qoi_read decode a 16-bit file they set QOI_16BIT in
+desc.colorspace and return host-endian uint16 samples. For 16-bit files the
+"channels" argument of qoi_decode/qoi_read must be 0 (use the file's channel
+count); forcing a different channel count is not supported and fails.
+
 */
 
 
@@ -232,6 +264,11 @@ how chunks are en-/decoded. */
 
 #define QOI_SRGB   0
 #define QOI_LINEAR 1
+
+/* Flag to OR into qoi_desc.colorspace to request 16-bit encoding with
+qoi_write/qoi_encode, and to detect 16-bit results from qoi_read/qoi_decode.
+See the "16-bit extension (QOI16)" section at the top of this file. */
+#define QOI_16BIT  0x80
 
 typedef struct {
 	unsigned int width;
@@ -325,6 +362,15 @@ Implementation */
 	 ((unsigned int)'i') <<  8 | ((unsigned int)'f'))
 #define QOI_HEADER_SIZE 14
 
+/* 16-bit extension (QOI16): distinct magic, 16 byte header with an extra
+flags byte (must be QOI16_FLAGS) and a bitdepth byte (must be 16). */
+#define QOI_MAGIC16 \
+	(((unsigned int)'q') << 24 | ((unsigned int)'o') << 16 | \
+	 ((unsigned int)'i') <<  8 | ((unsigned int)'F'))
+#define QOI16_HEADER_SIZE 16
+#define QOI16_FLAGS 0x01
+#define QOI16_BITDEPTH 16
+
 /* 2GB is the max file size that this implementation can safely handle. We guard
 against anything larger than that, assuming the worst case with 5 bytes per
 pixel, rounded down to a nice clean value. 400 million pixels ought to be
@@ -335,6 +381,13 @@ typedef union {
 	struct { unsigned char r, g, b, a; } rgba;
 	unsigned int v;
 } qoi_rgba_t;
+
+typedef struct {
+	struct { unsigned short r, g, b, a; } rgba;
+} qoi16_rgba_t;
+
+#define QOI16_COLOR_HASH(C) \
+	(C.rgba.r*3 + C.rgba.g*5 + C.rgba.b*7 + C.rgba.a*11)
 
 static const unsigned char qoi_padding[8] = {0,0,0,0,0,0,0,1};
 
@@ -353,6 +406,305 @@ static unsigned int qoi_read_32(const unsigned char *bytes, int *p) {
 	return a << 24 | b << 16 | c << 8 | d;
 }
 
+static void qoi_write_16(unsigned char *bytes, int *p, unsigned int v) {
+	bytes[(*p)++] = (0xff00 & v) >> 8;
+	bytes[(*p)++] = (0x00ff & v);
+}
+
+static unsigned int qoi_read_16(const unsigned char *bytes, int *p) {
+	unsigned int a = bytes[(*p)++];
+	unsigned int b = bytes[(*p)++];
+	return a << 8 | b;
+}
+
+static int qoi16_px_eq(qoi16_rgba_t a, qoi16_rgba_t b) {
+	return
+		a.rgba.r == b.rgba.r && a.rgba.g == b.rgba.g &&
+		a.rgba.b == b.rgba.b && a.rgba.a == b.rgba.a;
+}
+
+/* 16-bit (QOI16) encoder. Input is host-endian uint16 samples,
+desc->width * desc->height * desc->channels of them. Only called from
+qoi_encode when desc->colorspace has the QOI_16BIT flag. */
+static void *qoi_encode16(const void *data, const qoi_desc *desc, int *out_len) {
+	int i, p, run;
+	unsigned int px_len, px_end, px_pos, channels;
+	size_t max_size;
+	unsigned char *bytes;
+	const unsigned short *pixels;
+	qoi16_rgba_t index[64];
+	qoi16_rgba_t px, px_prev;
+
+	if (
+		data == NULL || out_len == NULL || desc == NULL ||
+		desc->width == 0 || desc->height == 0 ||
+		desc->channels < 1 || desc->channels > 4 ||
+		(desc->colorspace & ~QOI_16BIT) > 1 ||
+		desc->height >= QOI_PIXELS_MAX / desc->width
+	) {
+		return NULL;
+	}
+
+	max_size =
+		(size_t)desc->width * desc->height * ((size_t)desc->channels * 2 + 1) +
+		QOI16_HEADER_SIZE + sizeof(qoi_padding);
+
+	p = 0;
+	bytes = (unsigned char *) QOI_MALLOC(max_size);
+	if (!bytes) {
+		return NULL;
+	}
+
+	qoi_write_32(bytes, &p, QOI_MAGIC16);
+	qoi_write_32(bytes, &p, desc->width);
+	qoi_write_32(bytes, &p, desc->height);
+	bytes[p++] = desc->channels;
+	bytes[p++] = desc->colorspace & ~QOI_16BIT;
+	bytes[p++] = QOI16_FLAGS;
+	bytes[p++] = QOI16_BITDEPTH;
+
+	pixels = (const unsigned short *)data;
+
+	QOI_ZEROARR(index);
+
+	run = 0;
+	px_prev.rgba.r = 0;
+	px_prev.rgba.g = 0;
+	px_prev.rgba.b = 0;
+	px_prev.rgba.a = 0xffff;
+	px = px_prev;
+
+	px_len = desc->width * desc->height * desc->channels;
+	px_end = px_len - desc->channels;
+	channels = desc->channels;
+
+	for (px_pos = 0; px_pos < px_len; px_pos += channels) {
+		if (channels < 3) {
+			px.rgba.r = px.rgba.g = px.rgba.b = pixels[px_pos + 0];
+			if (channels == 2) {
+				px.rgba.a = pixels[px_pos + 1];
+			}
+		}
+		else {
+			px.rgba.r = pixels[px_pos + 0];
+			px.rgba.g = pixels[px_pos + 1];
+			px.rgba.b = pixels[px_pos + 2];
+			if (channels == 4) {
+				px.rgba.a = pixels[px_pos + 3];
+			}
+		}
+
+		if (qoi16_px_eq(px, px_prev)) {
+			run++;
+			if (run == 62 || px_pos == px_end) {
+				bytes[p++] = QOI_OP_RUN | (run - 1);
+				run = 0;
+			}
+		}
+		else {
+			int index_pos;
+
+			if (run > 0) {
+				bytes[p++] = QOI_OP_RUN | (run - 1);
+				run = 0;
+			}
+
+			index_pos = QOI16_COLOR_HASH(px) & (64 - 1);
+
+			if (qoi16_px_eq(index[index_pos], px)) {
+				bytes[p++] = QOI_OP_INDEX | index_pos;
+			}
+			else {
+				index[index_pos] = px;
+
+				if (px.rgba.a == px_prev.rgba.a) {
+					short vr = (short)(px.rgba.r - px_prev.rgba.r);
+					short vg = (short)(px.rgba.g - px_prev.rgba.g);
+					short vb = (short)(px.rgba.b - px_prev.rgba.b);
+
+					short vg_r = (short)(vr - vg);
+					short vg_b = (short)(vb - vg);
+
+					if (
+						vr > -3 && vr < 2 &&
+						vg > -3 && vg < 2 &&
+						vb > -3 && vb < 2
+					) {
+						bytes[p++] = QOI_OP_DIFF | (vr + 2) << 4 | (vg + 2) << 2 | (vb + 2);
+					}
+					else if (
+						vg_r >  -9 && vg_r <  8 &&
+						vg   > -33 && vg   < 32 &&
+						vg_b >  -9 && vg_b <  8
+					) {
+						bytes[p++] = QOI_OP_LUMA     | (vg   + 32);
+						bytes[p++] = (vg_r + 8) << 4 | (vg_b +  8);
+					}
+					else {
+						bytes[p++] = QOI_OP_RGB;
+						if (channels < 3) {
+							qoi_write_16(bytes, &p, px.rgba.r);
+						}
+						else {
+							qoi_write_16(bytes, &p, px.rgba.r);
+							qoi_write_16(bytes, &p, px.rgba.g);
+							qoi_write_16(bytes, &p, px.rgba.b);
+						}
+					}
+				}
+				else {
+					bytes[p++] = QOI_OP_RGBA;
+					if (channels < 3) {
+						qoi_write_16(bytes, &p, px.rgba.r);
+						qoi_write_16(bytes, &p, px.rgba.a);
+					}
+					else {
+						qoi_write_16(bytes, &p, px.rgba.r);
+						qoi_write_16(bytes, &p, px.rgba.g);
+						qoi_write_16(bytes, &p, px.rgba.b);
+						qoi_write_16(bytes, &p, px.rgba.a);
+					}
+				}
+			}
+		}
+		px_prev = px;
+	}
+
+	for (i = 0; i < (int)sizeof(qoi_padding); i++) {
+		bytes[p++] = qoi_padding[i];
+	}
+
+	*out_len = p;
+	return bytes;
+}
+
+/* 16-bit (QOI16) decoder. Returns host-endian uint16 samples. Only called
+from qoi_decode when the header magic is QOI_MAGIC16. */
+static void *qoi_decode16(const void *data, int size, qoi_desc *desc, int channels) {
+	const unsigned char *bytes;
+	unsigned char flags, bitdepth;
+	unsigned short *pixels;
+	qoi16_rgba_t index[64];
+	qoi16_rgba_t px;
+	unsigned int px_len, px_pos, out_channels;
+	int chunks_len;
+	int p = 0, run = 0;
+
+	if (size < QOI16_HEADER_SIZE + (int)sizeof(qoi_padding)) {
+		return NULL;
+	}
+
+	bytes = (const unsigned char *)data;
+
+	p = 4; /* magic already checked by caller */
+	desc->width = qoi_read_32(bytes, &p);
+	desc->height = qoi_read_32(bytes, &p);
+	desc->channels = bytes[p++];
+	desc->colorspace = bytes[p++];
+	flags = bytes[p++];
+	bitdepth = bytes[p++];
+
+	if (
+		desc->width == 0 || desc->height == 0 ||
+		desc->channels < 1 || desc->channels > 4 ||
+		desc->colorspace > 1 ||
+		flags != QOI16_FLAGS ||
+		bitdepth != QOI16_BITDEPTH ||
+		desc->height >= QOI_PIXELS_MAX / desc->width ||
+		(channels != 0 && channels != (int)desc->channels)
+	) {
+		return NULL;
+	}
+
+	out_channels = desc->channels;
+	desc->colorspace |= QOI_16BIT;
+
+	px_len = desc->width * desc->height * out_channels;
+	pixels = (unsigned short *) QOI_MALLOC((size_t)px_len * 2);
+	if (!pixels) {
+		return NULL;
+	}
+
+	QOI_ZEROARR(index);
+	px.rgba.r = 0;
+	px.rgba.g = 0;
+	px.rgba.b = 0;
+	px.rgba.a = 0xffff;
+
+	chunks_len = size - (int)sizeof(qoi_padding);
+	for (px_pos = 0; px_pos < px_len; px_pos += out_channels) {
+		if (run > 0) {
+			run--;
+		}
+		else if (p < chunks_len) {
+			int b1 = bytes[p++];
+
+			if (b1 == QOI_OP_RGB) {
+				if (desc->channels < 3) {
+					px.rgba.r = px.rgba.g = px.rgba.b =
+						(unsigned short)qoi_read_16(bytes, &p);
+				}
+				else {
+					px.rgba.r = (unsigned short)qoi_read_16(bytes, &p);
+					px.rgba.g = (unsigned short)qoi_read_16(bytes, &p);
+					px.rgba.b = (unsigned short)qoi_read_16(bytes, &p);
+				}
+			}
+			else if (b1 == QOI_OP_RGBA) {
+				if (desc->channels < 3) {
+					px.rgba.r = px.rgba.g = px.rgba.b =
+						(unsigned short)qoi_read_16(bytes, &p);
+					px.rgba.a = (unsigned short)qoi_read_16(bytes, &p);
+				}
+				else {
+					px.rgba.r = (unsigned short)qoi_read_16(bytes, &p);
+					px.rgba.g = (unsigned short)qoi_read_16(bytes, &p);
+					px.rgba.b = (unsigned short)qoi_read_16(bytes, &p);
+					px.rgba.a = (unsigned short)qoi_read_16(bytes, &p);
+				}
+			}
+			else if ((b1 & QOI_MASK_2) == QOI_OP_INDEX) {
+				px = index[b1];
+			}
+			else if ((b1 & QOI_MASK_2) == QOI_OP_DIFF) {
+				px.rgba.r = (unsigned short)(px.rgba.r + ((b1 >> 4) & 0x03) - 2);
+				px.rgba.g = (unsigned short)(px.rgba.g + ((b1 >> 2) & 0x03) - 2);
+				px.rgba.b = (unsigned short)(px.rgba.b + ( b1       & 0x03) - 2);
+			}
+			else if ((b1 & QOI_MASK_2) == QOI_OP_LUMA) {
+				int b2 = bytes[p++];
+				int vg = (b1 & 0x3f) - 32;
+				px.rgba.r = (unsigned short)(px.rgba.r + vg - 8 + ((b2 >> 4) & 0x0f));
+				px.rgba.g = (unsigned short)(px.rgba.g + vg);
+				px.rgba.b = (unsigned short)(px.rgba.b + vg - 8 + ( b2       & 0x0f));
+			}
+			else if ((b1 & QOI_MASK_2) == QOI_OP_RUN) {
+				run = (b1 & 0x3f);
+			}
+
+			index[QOI16_COLOR_HASH(px) & (64 - 1)] = px;
+		}
+
+		if (out_channels < 3) {
+			pixels[px_pos + 0] = px.rgba.r;
+			if (out_channels == 2) {
+				pixels[px_pos + 1] = px.rgba.a;
+			}
+		}
+		else {
+			pixels[px_pos + 0] = px.rgba.r;
+			pixels[px_pos + 1] = px.rgba.g;
+			pixels[px_pos + 2] = px.rgba.b;
+			if (out_channels == 4) {
+				pixels[px_pos + 3] = px.rgba.a;
+			}
+		}
+	}
+
+	return pixels;
+}
+
+
 void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	int i, max_size, p, run;
 	int px_len, px_end, px_pos, channels;
@@ -360,6 +712,10 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	const unsigned char *pixels;
 	qoi_rgba_t index[64];
 	qoi_rgba_t px, px_prev;
+
+	if (desc && (desc->colorspace & QOI_16BIT)) {
+		return qoi_encode16(data, desc, out_len);
+	}
 
 	if (
 		data == NULL || out_len == NULL || desc == NULL ||
@@ -505,6 +861,9 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 	bytes = (const unsigned char *)data;
 
 	header_magic = qoi_read_32(bytes, &p);
+	if (header_magic == QOI_MAGIC16) {
+		return qoi_decode16(data, size, desc, channels);
+	}
 	desc->width = qoi_read_32(bytes, &p);
 	desc->height = qoi_read_32(bytes, &p);
 	desc->channels = bytes[p++];
