@@ -289,6 +289,68 @@ The returned pixel data should be free()d after use. */
 void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels);
 
 
+/* --- Corruption recovery API ------------------------------------------------
+
+The regular qoi_decode() above fails entirely as soon as a chunk can not be
+parsed (e.g. a truncated file). qoi_decode_recover() instead records the
+position of any unparseable chunk, scans forward for the next parseable
+chunk header and resumes decoding there. Pixel regions that can not be
+recovered this way are painted with a caller supplied fill color.
+
+qoi_rgb_fill is the fill color used for unrecoverable regions.
+
+qoi_recovery_stats reports what happened during a recovery run. All counters
+are zero for an intact image.
+  bytes_scanned       total number of bytes examined while resyncing
+  errors              number of unrecoverable events (bad header, illegal or
+                      truncated chunk that had to be skipped, stream
+                      exhaustion before all pixels were decoded)
+  resyncs             number of times a parseable chunk header was found by
+                      scanning forward
+  recovered_pixels    pixels decoded from the stream
+  fill_pixels         pixels that had to be painted with the fill color
+  last_error_pos      byte offset of the last offending chunk tag, or -1
+
+qoi_recovery_options configures the forward scan.
+  scan_window         maximum number of bytes scanned while looking for the
+                      next chunk header
+  max_skip_bytes      maximum number of bytes that may be skipped in total
+  fill                color used for unrecoverable regions
+  stats               may be NULL; otherwise filled with the run statistics
+
+Invalid parameters (zero/negative scan window or max_skip_bytes) make
+qoi_decode_recover() return NULL. A damaged header can not be recovered
+either: the function returns NULL and, if stats != NULL, records one error. */
+
+typedef struct {
+	unsigned char r, g, b, a;
+} qoi_rgb_fill;
+
+typedef struct {
+	int errors;
+	int resyncs;
+	int recovered_pixels;
+	int fill_pixels;
+	int bytes_scanned;
+	int last_error_pos;
+} qoi_recovery_stats;
+
+typedef struct {
+	int scan_window;
+	int max_skip_bytes;
+	qoi_rgb_fill fill;
+	qoi_recovery_stats *stats;
+} qoi_recovery_options;
+
+/* Same as qoi_decode(), but tolerant of corrupted chunk data. The returned
+pixels always cover width * height; unrecoverable regions contain the fill
+color. Returns NULL only on invalid parameters, a damaged header or a
+malloc failure. The returned pixel data should be free()d after use. */
+
+void *qoi_decode_recover(const void *data, int size, qoi_desc *desc,
+	int channels, const qoi_recovery_options *options);
+
+
 #ifdef __cplusplus
 }
 #endif
@@ -580,13 +642,256 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 		pixels[px_pos + 0] = px.rgba.r;
 		pixels[px_pos + 1] = px.rgba.g;
 		pixels[px_pos + 2] = px.rgba.b;
-		
+
 		if (channels == 4) {
 			pixels[px_pos + 3] = px.rgba.a;
 		}
 	}
 
 	return pixels;
+}
+
+/* Returns the total size in bytes (tag included) of the chunk starting at
+position p. Every possible tag byte maps to a defined chunk length; 0xfe and
+0xff (RGB/RGBA) have to be checked before the 2-bit RUN tag. */
+
+static int qoi_chunk_len(const unsigned char *bytes, int p) {
+	int b1 = bytes[p];
+	if (b1 == QOI_OP_RGB) { return 4; }
+	if (b1 == QOI_OP_RGBA) { return 5; }
+	if ((b1 & QOI_MASK_2) == QOI_OP_LUMA) { return 2; }
+	return 1; /* QOI_OP_INDEX, QOI_OP_DIFF and QOI_OP_RUN */
+}
+
+/* Scan [from, chunks_len) for the first byte that starts a chunk whose full
+extent is inside the chunk area. The scan covers at most scan_window bytes
+and at most skip_budget bytes. *scanned counts every byte examined.
+Returns 1 and stores the position in *found on success, 0 otherwise. */
+
+static int qoi_find_chunk(const unsigned char *bytes, int from, int chunks_len,
+	int scan_window, int skip_budget, int *found, int *scanned)
+{
+	int limit = from + scan_window;
+	int i;
+
+	if (limit > chunks_len) {
+		limit = chunks_len;
+	}
+	if (limit > from + skip_budget) {
+		limit = from + skip_budget;
+	}
+
+	for (i = from; i < limit; i++) {
+		(*scanned)++;
+		if (i + qoi_chunk_len(bytes, i) <= chunks_len) {
+			*found = i;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* Paint every pixel from px_pos to px_len with the fill color. */
+
+static void qoi_fill_pixels(unsigned char *pixels, int px_pos, int px_len,
+	int channels, qoi_rgb_fill fill, int *fill_count)
+{
+	for (; px_pos < px_len; px_pos += channels) {
+		pixels[px_pos + 0] = fill.r;
+		pixels[px_pos + 1] = fill.g;
+		pixels[px_pos + 2] = fill.b;
+		if (channels == 4) {
+			pixels[px_pos + 3] = fill.a;
+		}
+		(*fill_count)++;
+	}
+}
+
+void *qoi_decode_recover(const void *data, int size, qoi_desc *desc,
+	int channels, const qoi_recovery_options *options)
+{
+	const unsigned char *bytes;
+	unsigned int header_magic;
+	unsigned char *pixels;
+	qoi_rgba_t index[64];
+	qoi_rgba_t px;
+	qoi_rgb_fill fill;
+	qoi_recovery_stats *st;
+	int px_len, chunks_len, px_pos;
+	int p = 0, run = 0;
+	int errors = 0, resyncs = 0, recovered = 0, filled = 0;
+	int scanned = 0, last_err = -1;
+	int scan_window, max_skip, skip_total = 0;
+
+	if (
+		data == NULL || desc == NULL || options == NULL ||
+		(channels != 0 && channels != 3 && channels != 4) ||
+		size < QOI_HEADER_SIZE + (int)sizeof(qoi_padding) ||
+		options->scan_window < 1 || options->max_skip_bytes < 1
+	) {
+		return NULL;
+	}
+
+	st = options->stats;
+	if (st) {
+		st->errors = 0;
+		st->resyncs = 0;
+		st->recovered_pixels = 0;
+		st->fill_pixels = 0;
+		st->bytes_scanned = 0;
+		st->last_error_pos = -1;
+	}
+
+	scan_window = options->scan_window;
+	max_skip = options->max_skip_bytes;
+	fill = options->fill;
+
+	bytes = (const unsigned char *)data;
+
+	header_magic = qoi_read_32(bytes, &p);
+	desc->width = qoi_read_32(bytes, &p);
+	desc->height = qoi_read_32(bytes, &p);
+	desc->channels = bytes[p++];
+	desc->colorspace = bytes[p++];
+
+	if (
+		desc->width == 0 || desc->height == 0 ||
+		desc->channels < 3 || desc->channels > 4 ||
+		desc->colorspace > 1 ||
+		header_magic != QOI_MAGIC ||
+		desc->height >= QOI_PIXELS_MAX / desc->width
+	) {
+		/* A damaged header can not be recovered: nothing identifies the
+		image dimensions or where the chunk area starts. */
+		errors = 1;
+		last_err = 0;
+		goto flush_fail;
+	}
+
+	if (channels == 0) {
+		channels = desc->channels;
+	}
+
+	px_len = desc->width * desc->height * channels;
+	pixels = (unsigned char *) QOI_MALLOC(px_len);
+	if (!pixels) {
+		goto flush_fail;
+	}
+
+	QOI_ZEROARR(index);
+	px.rgba.r = 0;
+	px.rgba.g = 0;
+	px.rgba.b = 0;
+	px.rgba.a = 255;
+
+	chunks_len = size - (int)sizeof(qoi_padding);
+	px_pos = 0;
+	while (px_pos < px_len) {
+		if (run > 0) {
+			run--;
+		}
+		else if (p < chunks_len) {
+			int bad_p = p;
+			int b1 = bytes[p];
+			int clen = qoi_chunk_len(bytes, p);
+
+			if (p + clen > chunks_len) {
+				/* Illegal/truncated chunk: record its position and look
+				forward for the next parseable chunk header. */
+				int found_p = 0;
+				int budget = max_skip - skip_total;
+				errors++;
+				last_err = bad_p;
+
+				if (budget < 1 ||
+					!qoi_find_chunk(bytes, bad_p + 1, chunks_len,
+						scan_window, budget, &found_p, &scanned)) {
+					qoi_fill_pixels(pixels, px_pos, px_len, channels,
+						fill, &filled);
+					goto done;
+				}
+				skip_total += found_p - bad_p;
+				p = found_p;
+				resyncs++;
+				/* Reparse this same pixel from the recovered chunk. */
+				continue;
+			}
+
+			p++;
+
+			if (b1 == QOI_OP_RGB) {
+				px.rgba.r = bytes[p++];
+				px.rgba.g = bytes[p++];
+				px.rgba.b = bytes[p++];
+			}
+			else if (b1 == QOI_OP_RGBA) {
+				px.rgba.r = bytes[p++];
+				px.rgba.g = bytes[p++];
+				px.rgba.b = bytes[p++];
+				px.rgba.a = bytes[p++];
+			}
+			else if ((b1 & QOI_MASK_2) == QOI_OP_INDEX) {
+				px = index[b1];
+			}
+			else if ((b1 & QOI_MASK_2) == QOI_OP_DIFF) {
+				px.rgba.r += ((b1 >> 4) & 0x03) - 2;
+				px.rgba.g += ((b1 >> 2) & 0x03) - 2;
+				px.rgba.b += ( b1       & 0x03) - 2;
+			}
+			else if ((b1 & QOI_MASK_2) == QOI_OP_LUMA) {
+				int b2 = bytes[p++];
+				int vg = (b1 & 0x3f) - 32;
+				px.rgba.r += vg - 8 + ((b2 >> 4) & 0x0f);
+				px.rgba.g += vg;
+				px.rgba.b += vg - 8 +  (b2       & 0x0f);
+			}
+			else if ((b1 & QOI_MASK_2) == QOI_OP_RUN) {
+				run = (b1 & 0x3f);
+			}
+
+			index[QOI_COLOR_HASH(px) & (64 - 1)] = px;
+		}
+		else {
+			/* The stream ended before all pixels were covered: fill the
+			remaining region instead of repeating the last pixel. */
+			errors++;
+			last_err = chunks_len;
+			qoi_fill_pixels(pixels, px_pos, px_len, channels, fill, &filled);
+			goto done;
+		}
+
+		pixels[px_pos + 0] = px.rgba.r;
+		pixels[px_pos + 1] = px.rgba.g;
+		pixels[px_pos + 2] = px.rgba.b;
+
+		if (channels == 4) {
+			pixels[px_pos + 3] = px.rgba.a;
+		}
+		recovered++;
+		px_pos += channels;
+	}
+
+done:
+	if (st) {
+		st->errors = errors;
+		st->resyncs = resyncs;
+		st->recovered_pixels = recovered;
+		st->fill_pixels = filled;
+		st->bytes_scanned = scanned;
+		st->last_error_pos = last_err;
+	}
+	return pixels;
+
+flush_fail:
+	if (st) {
+		st->errors = errors;
+		st->resyncs = resyncs;
+		st->recovered_pixels = recovered;
+		st->fill_pixels = filled;
+		st->bytes_scanned = scanned;
+		st->last_error_pos = last_err;
+	}
+	return NULL;
 }
 
 #ifndef QOI_NO_STDIO
