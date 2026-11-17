@@ -289,6 +289,77 @@ The returned pixel data should be free()d after use. */
 void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels);
 
 
+/* -----------------------------------------------------------------------------
+Optional color transform extension
+
+The functions below are an optional extension. The regular qoi_encode() and
+qoi_decode() functions above are completely unaffected by them.
+
+Before encoding, each pixel's RGB channels may be transformed by a configurable
+3x3 integer matrix (a YCoCg-like decorrelating transform for example); the
+decoder applies the inverse matrix to restore the original RGB. The alpha
+channel is never transformed. The arithmetic is done modulo 256 on the byte
+domain, so a round trip is exactly lossless whenever the matrix is invertible
+modulo 256.
+
+A 3x3 integer matrix is invertible modulo 256 iff its determinant is odd.
+A determinant of 0 (a truly singular matrix) or any even determinant (e.g. the
+classic YCoCg matrix, whose determinant is a multiple of 4) can therefore not
+be inverted and is rejected. When the matrix is rejected, or the extension is
+not enabled, qoi_encode_opt() falls back to the plain qoi_encode() code path
+byte for byte and reports the fallback through the fell_back flag. The same
+matrix is re-validated by qoi_decode_opt(); on rejection it decodes the stream
+as plain QOI without applying an inverse.
+
+The output of qoi_encode_opt() is still a standard, byte-compatible QOI
+stream: only the in-memory pixel representation fed to the normal QOI chunk
+encoder differs. A file produced with a color transform can be decoded by any
+regular QOI decoder, it merely yields the transformed colors. */
+
+typedef struct {
+	/* Set to 1 to enable the color transform. When 0, the matrix is
+	ignored, qoi_encode_opt() behaves exactly like qoi_encode() and the
+	output bytes are identical. */
+	int use_transform;
+
+	/* 3x3 transform matrix in row-major order, applied as
+		y0 = m[0]*r + m[1]*g + m[2]*b   (mod 256)
+		y1 = m[3]*r + m[4]*g + m[5]*b   (mod 256)
+		y2 = m[6]*r + m[7]*g + m[8]*b   (mod 256)
+	Each entry must be in [-32768, 32767]. Entries outside that range, or a
+	matrix that is not invertible modulo 256 (det == 0 or even), make the
+	encoder fall back to plain QOI and make the decoder skip the inverse. */
+	int matrix[9];
+
+	/* Per-channel residuals. When 0 (default), the normal QOI difference
+	coding is used on the transformed colors, including the QOI_OP_LUMA
+	chunk which couples the green/luma channel to the other two.
+	When 1, QOI_OP_LUMA is never emitted: residuals are encoded channel by
+	channel (QOI_OP_DIFF) or as full values (QOI_OP_RGB). This only
+	changes which chunks the encoder picks; the decoder stays fully
+	standard QOI. */
+	int per_channel_residuals;
+
+	/* Output only. Set to 1 by qoi_encode_opt() when it fell back to the
+	plain qoi_encode() path (transform disabled, invalid matrix entries or
+	a matrix that is singular / not invertible modulo 256). Ignored on
+	input. */
+	int fell_back;
+} qoi_options;
+
+/* Same as qoi_encode(), but applies the configured color transform and
+residual coding first. On failure returns NULL, exactly like qoi_encode(). */
+void *qoi_encode_opt(const void *data, const qoi_desc *desc,
+	const qoi_options *opt, int *out_len);
+
+/* Same as qoi_decode(), but applies the inverse color transform after
+decoding. The qoi_options struct only needs use_transform and matrix[9];
+per_channel_residuals and fell_back are irrelevant for decoding. If the
+matrix is not invertible modulo 256 the stream is decoded as plain QOI. */
+void *qoi_decode_opt(const void *data, int size, qoi_desc *desc,
+	int channels, const qoi_options *opt);
+
+
 #ifdef __cplusplus
 }
 #endif
@@ -589,6 +660,280 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 	return pixels;
 }
 
+/* -----------------------------------------------------------------------------
+Optional color transform extension - implementation */
+
+/* A 3x3 integer matrix is invertible modulo 256 iff its determinant is odd.
+Returns 1 and fills inv[9] with the inverse matrix modulo 256 when the matrix
+is usable; returns 0 for invalid entries, a singular matrix (det == 0) or an
+even determinant. The entries are bounded so det cannot overflow an int. */
+static int qoi_matrix_inverse_256(const int m[9], int inv[9]) {
+	int i;
+	for (i = 0; i < 9; i++) {
+		if (m[i] < -32768 || m[i] > 32767) {
+			return 0;
+		}
+	}
+
+	/* Cofactors / adjugate of the 3x3 matrix. */
+	int c[9];
+	c[0] = m[4]*m[8] - m[5]*m[7];
+	c[1] = m[5]*m[6] - m[3]*m[8];
+	c[2] = m[3]*m[7] - m[4]*m[6];
+	c[3] = m[2]*m[7] - m[1]*m[8];
+	c[4] = m[0]*m[8] - m[2]*m[6];
+	c[5] = m[1]*m[6] - m[0]*m[7];
+	c[6] = m[1]*m[5] - m[2]*m[4];
+	c[7] = m[2]*m[3] - m[0]*m[5];
+	c[8] = m[0]*m[4] - m[1]*m[3];
+
+	/* det via the first row and its cofactors. */
+	int det = m[0]*c[0] + m[1]*c[1] + m[2]*c[2];
+	det &= 255;
+
+	if ((det & 1) == 0) {
+		/* det == 0 means the matrix is singular; any even determinant is
+		not invertible modulo 256. Both are reported as unusable. */
+		return 0;
+	}
+
+	/* Multiplicative inverse of the (odd) determinant modulo 256. */
+	int det_inv = 0;
+	for (i = 1; i < 256; i += 2) {
+		if (((det * i) & 255) == 1) {
+			det_inv = i;
+			break;
+		}
+	}
+	if (det_inv == 0) {
+		return 0;
+	}
+
+	/* inv = adjugate * det_inv, transposed into row-major order. */
+	inv[0] = (c[0] * det_inv) & 255;
+	inv[1] = (c[3] * det_inv) & 255;
+	inv[2] = (c[6] * det_inv) & 255;
+	inv[3] = (c[1] * det_inv) & 255;
+	inv[4] = (c[4] * det_inv) & 255;
+	inv[5] = (c[7] * det_inv) & 255;
+	inv[6] = (c[2] * det_inv) & 255;
+	inv[7] = (c[5] * det_inv) & 255;
+	inv[8] = (c[8] * det_inv) & 255;
+	return 1;
+}
+
+static unsigned char qoi_mul256(int a, int b) {
+	return (unsigned char)((a * b) & 255);
+}
+
+/* Apply a 3x3 matrix modulo 256 to the RGB channels of a pixel buffer. The
+alpha channel is left untouched. Works in place (src == dst is allowed). */
+static void qoi_apply_matrix3(unsigned char *dst, const unsigned char *src,
+	int px_len, int channels, const int m[9])
+{
+	int px_pos;
+	for (px_pos = 0; px_pos < px_len; px_pos += channels) {
+		int r = src[px_pos + 0];
+		int g = src[px_pos + 1];
+		int b = src[px_pos + 2];
+		dst[px_pos + 0] = qoi_mul256(m[0], r) + qoi_mul256(m[1], g) + qoi_mul256(m[2], b);
+		dst[px_pos + 1] = qoi_mul256(m[3], r) + qoi_mul256(m[4], g) + qoi_mul256(m[5], b);
+		dst[px_pos + 2] = qoi_mul256(m[6], r) + qoi_mul256(m[7], g) + qoi_mul256(m[8], b);
+		if (channels == 4 && dst != src) {
+			dst[px_pos + 3] = src[px_pos + 3];
+		}
+	}
+}
+
+/* QOI chunk encoder over an arbitrary pixel buffer. Identical to the encoder
+in qoi_encode(), except that QOI_OP_LUMA is skipped when per_channel is
+nonzero, so each channel's residual is coded on its own (QOI_OP_DIFF) or as a
+full value (QOI_OP_RGB). */
+static void *qoi_encode_with_options(const unsigned char *pixels,
+	const qoi_desc *desc, int per_channel, int *out_len)
+{
+	int i, max_size, p, run;
+	int px_len, px_end, px_pos, channels;
+	unsigned char *bytes;
+	qoi_rgba_t index[64];
+	qoi_rgba_t px, px_prev;
+
+	max_size =
+		desc->width * desc->height * (desc->channels + 1) +
+		QOI_HEADER_SIZE + sizeof(qoi_padding);
+
+	p = 0;
+	bytes = (unsigned char *) QOI_MALLOC(max_size);
+	if (!bytes) {
+		return NULL;
+	}
+
+	qoi_write_32(bytes, &p, QOI_MAGIC);
+	qoi_write_32(bytes, &p, desc->width);
+	qoi_write_32(bytes, &p, desc->height);
+	bytes[p++] = desc->channels;
+	bytes[p++] = desc->colorspace;
+
+	QOI_ZEROARR(index);
+
+	run = 0;
+	px_prev.rgba.r = 0;
+	px_prev.rgba.g = 0;
+	px_prev.rgba.b = 0;
+	px_prev.rgba.a = 255;
+	px = px_prev;
+
+	px_len = desc->width * desc->height * desc->channels;
+	px_end = px_len - desc->channels;
+	channels = desc->channels;
+
+	for (px_pos = 0; px_pos < px_len; px_pos += channels) {
+		px.rgba.r = pixels[px_pos + 0];
+		px.rgba.g = pixels[px_pos + 1];
+		px.rgba.b = pixels[px_pos + 2];
+
+		if (channels == 4) {
+			px.rgba.a = pixels[px_pos + 3];
+		}
+
+		if (px.v == px_prev.v) {
+			run++;
+			if (run == 62 || px_pos == px_end) {
+				bytes[p++] = QOI_OP_RUN | (run - 1);
+				run = 0;
+			}
+		}
+		else {
+			int index_pos;
+
+			if (run > 0) {
+				bytes[p++] = QOI_OP_RUN | (run - 1);
+				run = 0;
+			}
+
+			index_pos = QOI_COLOR_HASH(px) & (64 - 1);
+
+			if (index[index_pos].v == px.v) {
+				bytes[p++] = QOI_OP_INDEX | index_pos;
+			}
+			else {
+				index[index_pos] = px;
+
+				if (px.rgba.a == px_prev.rgba.a) {
+					signed char vr = px.rgba.r - px_prev.rgba.r;
+					signed char vg = px.rgba.g - px_prev.rgba.g;
+					signed char vb = px.rgba.b - px_prev.rgba.b;
+
+					signed char vg_r = vr - vg;
+					signed char vg_b = vb - vg;
+
+					if (
+						vr > -3 && vr < 2 &&
+						vg > -3 && vg < 2 &&
+						vb > -3 && vb < 2
+					) {
+						bytes[p++] = QOI_OP_DIFF | (vr + 2) << 4 | (vg + 2) << 2 | (vb + 2);
+					}
+					else if (
+						!per_channel &&
+						vg_r >  -9 && vg_r <  8 &&
+						vg   > -33 && vg   < 32 &&
+						vg_b >  -9 && vg_b <  8
+					) {
+						bytes[p++] = QOI_OP_LUMA     | (vg   + 32);
+						bytes[p++] = (vg_r + 8) << 4 | (vg_b +  8);
+					}
+					else {
+						bytes[p++] = QOI_OP_RGB;
+						bytes[p++] = px.rgba.r;
+						bytes[p++] = px.rgba.g;
+						bytes[p++] = px.rgba.b;
+					}
+				}
+				else {
+					bytes[p++] = QOI_OP_RGBA;
+					bytes[p++] = px.rgba.r;
+					bytes[p++] = px.rgba.g;
+					bytes[p++] = px.rgba.b;
+					bytes[p++] = px.rgba.a;
+				}
+			}
+		}
+		px_prev = px;
+	}
+
+	for (i = 0; i < (int)sizeof(qoi_padding); i++) {
+		bytes[p++] = qoi_padding[i];
+	}
+
+	*out_len = p;
+	return bytes;
+}
+
+void *qoi_encode_opt(const void *data, const qoi_desc *desc,
+	const qoi_options *opt, int *out_len)
+{
+	int inv[9];
+	int px_len;
+	unsigned char *work;
+	void *encoded;
+
+	if (data == NULL || out_len == NULL || desc == NULL || opt == NULL) {
+		return NULL;
+	}
+
+	/* Fall back to the plain, byte-identical qoi_encode() path whenever the
+	transform is disabled or the matrix is not invertible modulo 256. */
+	if (!opt->use_transform || !qoi_matrix_inverse_256(opt->matrix, inv)) {
+		((qoi_options *)opt)->fell_back = 1;
+		return qoi_encode(data, desc, out_len);
+	}
+	((qoi_options *)opt)->fell_back = 0;
+
+	px_len = desc->width * desc->height * desc->channels;
+	work = (unsigned char *) QOI_MALLOC(px_len);
+	if (!work) {
+		return NULL;
+	}
+
+	qoi_apply_matrix3(work, (const unsigned char *)data, px_len,
+		desc->channels, opt->matrix);
+
+	encoded = qoi_encode_with_options(work, desc,
+		opt->per_channel_residuals ? 1 : 0, out_len);
+
+	QOI_FREE(work);
+	return encoded;
+}
+
+void *qoi_decode_opt(const void *data, int size, qoi_desc *desc,
+	int channels, const qoi_options *opt)
+{
+	int inv[9];
+	unsigned char *pixels;
+	int px_len, out_channels;
+
+	if (opt == NULL) {
+		return qoi_decode(data, size, desc, channels);
+	}
+
+	pixels = (unsigned char *) qoi_decode(data, size, desc, channels);
+	if (!pixels) {
+		return NULL;
+	}
+
+	/* If the matrix is not invertible modulo 256 the encoder must have
+	fallen back, so the stream holds plain RGB: return it untouched. */
+	if (!opt->use_transform || !qoi_matrix_inverse_256(opt->matrix, inv)) {
+		return pixels;
+	}
+
+	out_channels = (channels == 0) ? desc->channels : channels;
+	px_len = desc->width * desc->height * out_channels;
+	qoi_apply_matrix3(pixels, pixels, px_len, out_channels, inv);
+	return pixels;
+}
+
 #ifndef QOI_NO_STDIO
 #include <stdio.h>
 
@@ -646,4 +991,13 @@ void *qoi_read(const char *filename, qoi_desc *desc, int channels) {
 }
 
 #endif /* QOI_NO_STDIO */
+
+/* Test-only access to the modular matrix inversion check. Normal builds do
+not define QOI_TESTING, so this symbol never exists outside the test suite. */
+#ifdef QOI_TESTING
+int qoi_matrix_inverse_256_pub(const int m[9], int inv[9]) {
+	return qoi_matrix_inverse_256(m, inv);
+}
+#endif /* QOI_TESTING */
+
 #endif /* QOI_IMPLEMENTATION */
