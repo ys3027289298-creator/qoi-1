@@ -289,6 +289,83 @@ The returned pixel data should be free()d after use. */
 void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels);
 
 
+/* --- Temporal-stable dithering for image sequences -------------------------
+
+QOI itself is lossless. To shrink animation frames one typically quantizes
+each channel to fewer levels before encoding; doing this independently per
+frame makes flat regions "boil" (flicker), because every frame re-rolls its
+dither decisions.
+
+This helper quantizes a frame sequence with temporal error feedback: the
+quantization error of each pixel accumulates across frames and the
+accumulated error steers the dither phase, so the pattern evolves slowly and
+deterministically instead of jumping randomly every frame. The quantized
+frames are then encoded with the unmodified, lossless qoi_encode().
+
+	qoi_td_state st;
+	qoi_td_init(&st, &desc, 8, 4);            // 8 levels, phase step 4/256
+	for each frame:
+		void *enc = qoi_td_encode(&st, frame_pixels, &len);
+	qoi_td_free(&st);
+
+Parameters (validated by qoi_td_init, which returns 0 on any violation):
+	levels:     quantization levels per channel, 2..255
+	phase_step: dither phase increment per frame, 0..255, in units of
+	            1/256 of one quantization step. 0 keeps the pattern static,
+	            larger values rotate it faster.
+
+Phase discontinuity handling: when a pixel changes abruptly between frames
+(any channel differs by more than QOI_TD_CUT_THRESHOLD, default 64), its
+accumulated error is reset and its phase restarts from its spatial seed, so
+residuals from the old scene cannot bleed into the new one. qoi_td_reset()
+does the same for the whole image and rewinds the frame counter - call it
+at known scene cuts or loop points to make the sequence restart
+deterministically (identical input frames then produce identical output).
+
+These functions are additive: qoi_encode() and the single-frame path are
+completely unaffected. */
+
+typedef struct {
+	unsigned int width;
+	unsigned int height;
+	unsigned int channels;
+	unsigned int colorspace;
+	unsigned int levels;
+	unsigned int phase_step;
+	unsigned int frame;
+	int *err;                 /* per pixel+channel accumulated quant. error */
+	unsigned char *prev;      /* previous frame's source pixels */
+	unsigned char *qprev;     /* previous frame's quantized pixels */
+} qoi_td_state;
+
+/* Initialize the state from a qoi_desc (width/height/channels/colorspace),
+the number of quantization levels (2..255) and the per-frame phase step
+(0..255). Returns 0 on invalid parameters or allocation failure, 1 on
+success. On failure the state is left zeroed and needs no qoi_td_free(). */
+
+int qoi_td_init(qoi_td_state *st, const qoi_desc *desc, int levels, int phase_step);
+
+/* Reset all accumulated error and rewind the frame counter. Use at scene
+cuts or loop boundaries known to the caller. */
+
+void qoi_td_reset(qoi_td_state *st);
+
+/* Release memory held by the state. Safe to call on a zeroed state. */
+
+void qoi_td_free(qoi_td_state *st);
+
+/* Quantize one frame with temporal-stable dithering into out, which must
+hold width*height*channels bytes. Returns 0 on invalid parameters. */
+
+int qoi_td_quantize(qoi_td_state *st, const void *data, void *out);
+
+/* Quantize one frame and encode it with qoi_encode(). Returns NULL on
+failure (invalid parameters or malloc failed) or the encoded qoi data with
+out_len set, which should be free()d after use. */
+
+void *qoi_td_encode(qoi_td_state *st, const void *data, int *out_len);
+
+
 #ifdef __cplusplus
 }
 #endif
@@ -587,6 +664,209 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 	}
 
 	return pixels;
+}
+
+/* --- Temporal-stable dithering implementation --------------------------- */
+
+/* Per-channel frame-to-frame difference above which a pixel is treated as
+a scene cut: its accumulated error is dropped and its dither phase restarts
+from its spatial seed. */
+#ifndef QOI_TD_CUT_THRESHOLD
+	#define QOI_TD_CUT_THRESHOLD 64
+#endif
+
+int qoi_td_init(qoi_td_state *st, const qoi_desc *desc, int levels, int phase_step) {
+	unsigned int n;
+
+	if (st == NULL) {
+		return 0;
+	}
+	memset(st, 0, sizeof(*st));
+
+	if (
+		desc == NULL ||
+		desc->width == 0 || desc->height == 0 ||
+		desc->channels < 3 || desc->channels > 4 ||
+		desc->colorspace > 1 ||
+		desc->height >= QOI_PIXELS_MAX / desc->width ||
+		levels < 2 || levels > 255 ||
+		phase_step < 0 || phase_step > 255
+	) {
+		return 0;
+	}
+
+	n = desc->width * desc->height * desc->channels;
+	st->err = (int *) QOI_MALLOC(n * sizeof(int));
+	st->prev = (unsigned char *) QOI_MALLOC(n);
+	st->qprev = (unsigned char *) QOI_MALLOC(n);
+	if (st->err == NULL || st->prev == NULL || st->qprev == NULL) {
+		QOI_FREE(st->err);
+		QOI_FREE(st->prev);
+		QOI_FREE(st->qprev);
+		st->err = NULL;
+		st->prev = NULL;
+		st->qprev = NULL;
+		return 0;
+	}
+	memset(st->err, 0, n * sizeof(int));
+
+	st->width = desc->width;
+	st->height = desc->height;
+	st->channels = desc->channels;
+	st->colorspace = desc->colorspace;
+	st->levels = (unsigned int) levels;
+	st->phase_step = (unsigned int) phase_step;
+	st->frame = 0;
+	return 1;
+}
+
+void qoi_td_reset(qoi_td_state *st) {
+	if (st == NULL || st->err == NULL) {
+		return;
+	}
+	memset(st->err, 0, st->width * st->height * st->channels * sizeof(int));
+	st->frame = 0;
+}
+
+void qoi_td_free(qoi_td_state *st) {
+	if (st == NULL) {
+		return;
+	}
+	QOI_FREE(st->err);
+	QOI_FREE(st->prev);
+	QOI_FREE(st->qprev);
+	st->err = NULL;
+	st->prev = NULL;
+	st->qprev = NULL;
+}
+
+int qoi_td_quantize(qoi_td_state *st, const void *data, void *out) {
+	const unsigned char *pixels;
+	unsigned char *dst;
+	unsigned int npix, ch, q, i, c;
+
+	if (
+		st == NULL || st->err == NULL || st->prev == NULL ||
+		st->qprev == NULL || data == NULL || out == NULL
+	) {
+		return 0;
+	}
+
+	pixels = (const unsigned char *)data;
+	dst = (unsigned char *)out;
+	npix = st->width * st->height;
+	ch = st->channels;
+	q = st->levels - 1; /* quantization intervals; step = 255/q */
+
+	for (i = 0; i < npix; i++) {
+		/* Deterministic spatial seed, decorrelates neighboring pixels. */
+		unsigned int seed = ((i + 1) * 2654435761u) >> 24;
+		unsigned int base = i * ch;
+
+		/* Scene cut: drop the accumulated error so the old scene's
+		residual cannot bleed into the new one; the phase restarts from
+		the spatial seed. */
+		if (st->frame > 0) {
+			for (c = 0; c < ch; c++) {
+				int d = (int)pixels[base + c] - (int)st->prev[base + c];
+				if (d > QOI_TD_CUT_THRESHOLD || d < -QOI_TD_CUT_THRESHOLD) {
+					for (c = 0; c < ch; c++) {
+						st->err[base + c] = 0;
+					}
+					break;
+				}
+			}
+		}
+
+		for (c = 0; c < ch; c++) {
+			int src = pixels[base + c];
+			int err = st->err[base + c];
+			/* The accumulated error steers the dither phase; phase_step
+			rotates it by a configurable amount each frame. The error
+			only rotates the phase gradually (1/256 of a step per unit),
+			so the quantized level holds for runs of frames and flips
+			only when the integrated error demands it - this is what
+			keeps the output temporally stable. */
+			unsigned int phase =
+				(seed + st->frame * st->phase_step + (unsigned int)err) & 255;
+			/* Dither offset within (-step/2, step/2). */
+			int off = ((int)(2 * phase + 1 - 256) * 255) / (int)(512 * q);
+			int v = src + off;
+			int k, cand, quant;
+			/* Level-hold hysteresis: keep the previous level unless the
+			phase offset exceeds a quarter step, or the content itself
+			jumped by more than one step (scene motion). Prevents
+			bang-bang chattering of the error feedback loop. */
+			int hyst = 255 / (int)(4 * q) + 1;
+
+			if (v < 0) { v = 0; }
+			if (v > 255) { v = 255; }
+
+			k = (v * (int)q + 127) / 255;
+			cand = (k * 255 + (int)q / 2) / (int)q;
+
+			if (st->frame == 0 || cand == (int)st->qprev[base + c]) {
+				quant = cand;
+			}
+			else {
+				int step = (255 + (int)q / 2) / (int)q;
+				int jump = cand - (int)st->qprev[base + c];
+				if (jump > step || jump < -step) {
+					quant = cand; /* real content change, follow it */
+				}
+				else if (jump > 0 && off > hyst) {
+					quant = cand;
+				}
+				else if (jump < 0 && off < -hyst) {
+					quant = cand;
+				}
+				else {
+					quant = st->qprev[base + c]; /* hold */
+				}
+			}
+
+			dst[base + c] = (unsigned char)quant;
+			st->qprev[base + c] = (unsigned char)quant;
+			/* The output error accumulates across frames. The negative
+			feedback through the phase keeps it bounded and drives the
+			time-averaged quantization error to zero. */
+			st->err[base + c] = err + src - quant;
+		}
+
+		for (c = 0; c < ch; c++) {
+			st->prev[base + c] = pixels[base + c];
+		}
+	}
+
+	st->frame++;
+	return 1;
+}
+
+void *qoi_td_encode(qoi_td_state *st, const void *data, int *out_len) {
+	qoi_desc desc;
+	unsigned char *quant;
+	void *enc;
+
+	if (st == NULL || st->err == NULL || data == NULL || out_len == NULL) {
+		return NULL;
+	}
+
+	quant = (unsigned char *) QOI_MALLOC(st->width * st->height * st->channels);
+	if (quant == NULL) {
+		return NULL;
+	}
+	if (!qoi_td_quantize(st, data, quant)) {
+		QOI_FREE(quant);
+		return NULL;
+	}
+
+	desc.width = st->width;
+	desc.height = st->height;
+	desc.channels = (unsigned char)st->channels;
+	desc.colorspace = (unsigned char)st->colorspace;
+	enc = qoi_encode(quant, &desc, out_len);
+	QOI_FREE(quant);
+	return enc;
 }
 
 #ifndef QOI_NO_STDIO
