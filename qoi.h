@@ -289,6 +289,83 @@ The returned pixel data should be free()d after use. */
 void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels);
 
 
+/* -----------------------------------------------------------------------------
+QOI-Mask (qoim) - per-block channel-mask coding
+
+An optional, self-contained extension that never touches the regular qoi_*
+functions above: regular QOI encoding and decoding are byte-for-byte unaffected.
+
+The image is split into blocks of block_sz x block_sz pixels. For every block
+each channel is classified as either
+  - constant: all values in the block lie within an inclusive tolerance band
+              (max - min <= tolerance); one representative value is stored in
+              the block header and the channel contributes no per-pixel bytes,
+  - varying:  every value is stored verbatim, one byte per pixel.
+
+A block header holds an 8-bit mask (bit set => channel is varying), followed by
+one representative byte for each constant channel, in R,G,B,(A) order. The
+per-pixel data of the block stores the varying channels only, interleaved in
+channel order, row by row, left to right.
+
+File layout:
+  16-byte header: magic "qoim", width (BE32), height (BE32), then four
+                  single bytes: channels, block_sz, tolerance, reserved
+                  (reserved must be 0). The colorspace is always QOI_SRGB;
+                  like regular QOI it is not part of the pixel coding.
+  blocks as described above, covering width*height pixels (the last block may
+  extend past the image border; out-of-border pixels are not stored)
+  8-byte end marker: 0x00 * 7, 0x01
+
+tolerance == 0 is lossless; tolerance > 0 makes constant channels approximate
+(the representative value is the rounded mean of the block's channel values),
+varying channels are always stored exactly. */
+
+typedef struct {
+	unsigned char block_sz;  /* edge length of a square block, 1..255 */
+	unsigned char tolerance; /* inclusive constant-band tolerance, 0..255 */
+} qoim_options;
+
+/* Reasons reported by qoim_check() / qoim_decode() when a stream is rejected.
+The regular qoi_* functions do not use these. */
+typedef enum {
+	QOIM_OK = 0,
+	QOIM_ERR_ARG,        /* invalid function arguments                  */
+	QOIM_ERR_MAGIC,      /* bad magic / unsupported version             */
+	QOIM_ERR_HEADER,     /* bad width/height/channels/block_sz/options  */
+	QOIM_ERR_TRUNCATED,  /* stream ended before all blocks were covered */
+	QOIM_ERR_MASK,       /* reserved mask bits set / mask mismatch      */
+	QOIM_ERR_ENDMARKER,  /* missing 0x00*7,0x01 end marker              */
+	QOIM_ERR_NOMEM       /* allocation failed                           */
+} qoim_status;
+
+/* Encode raw RGB/RGBA pixels into a qoim stream. Returns NULL on invalid
+arguments or allocation failure; *out_len receives the stream size. The
+resulting buffer must be free()d (or QOI_FREE'd) by the caller. */
+void *qoim_encode(const void *data, const qoi_desc *desc,
+	const qoim_options *opt, int *out_len);
+
+/* Decode a qoim stream. Returns NULL (and sets *status when status is not
+NULL) on any malformed input, including a mask that is inconsistent with the
+block data and a missing end marker. On success *status is QOIM_OK. The
+resulting buffer must be free()d by the caller. */
+void *qoim_decode(const void *data, int size, qoi_desc *desc, int channels,
+	qoim_status *status);
+
+/* Verify that every block's mask is consistent with its stored data: constant
+channels must actually stay within the header's tolerance band and varying
+channels must be present for every pixel. Returns QOIM_OK on a consistent
+stream, otherwise the first detected violation. Does not allocate. */
+qoim_status qoim_check(const void *data, int size);
+
+/* Aggregate mask statistics for an encoded qoim stream. hit_channels /
+hit_blocks count constant (masked-off) channel occurrences; the _total
+fields receive the number of examinations. Returns QOIM_OK or an error
+status. Any of the pointers may be NULL. */
+qoim_status qoim_stats(const void *data, int size,
+	int *hit_channels, int *total_channels,
+	int *hit_blocks, int *total_blocks);
+
+
 #ifdef __cplusplus
 }
 #endif
@@ -646,4 +723,446 @@ void *qoi_read(const char *filename, qoi_desc *desc, int channels) {
 }
 
 #endif /* QOI_NO_STDIO */
+
+
+/* -----------------------------------------------------------------------------
+QOI-Mask implementation - independent of the regular qoi_* codec above.
+Nothing in this section is referenced by qoi_encode/qoi_decode, so the
+regular codec stays byte-for-byte identical. */
+
+#define QOIM_MAGIC \
+	(((unsigned int)'q') << 24 | ((unsigned int)'o') << 16 | \
+	 ((unsigned int)'i') <<  8 | ((unsigned int)'m'))
+#define QOIM_HEADER_SIZE 16
+#define QOIM_MASK_R 0x01
+#define QOIM_MASK_G 0x02
+#define QOIM_MASK_B 0x04
+#define QOIM_MASK_A 0x08
+
+static unsigned char qoim_mask_all(int channels) {
+	return (unsigned char)(channels == 3 ? 0x07 : 0x0f);
+}
+
+/* Validate a qoim stream's structure and, when pixels is not NULL, reconstruct
+the image into it (stride = out_channels). When the stat pointers are not
+NULL, mask hit counters are accumulated. Every read is bounds checked. */
+static qoim_status qoim_walk(const unsigned char *bytes, int size,
+	unsigned int width, unsigned int height, int channels, int block_sz,
+	int out_channels, unsigned char *pixels,
+	int *hit_px_ch, int *total_px_ch,
+	int *hit_blocks, int *total_blocks) {
+	int p = QOIM_HEADER_SIZE;
+	size_t nblocks_x, nblocks_y, nb, bi;
+	int s_hit_px = 0, s_full = 0;
+	size_t pixel_cap = pixels
+		? (size_t)width * height * (size_t)out_channels
+		: (size_t)0;
+
+	nblocks_x = ((size_t)width + (size_t)block_sz - 1) / (size_t)block_sz;
+	nblocks_y = ((size_t)height + (size_t)block_sz - 1) / (size_t)block_sz;
+	nb = nblocks_x * nblocks_y;
+
+	for (bi = 0; bi < nb; bi++) {
+		size_t blk_col = bi % nblocks_x;
+		size_t blk_row = bi / nblocks_x;
+		size_t x0 = blk_col * (size_t)block_sz;
+		size_t y0 = blk_row * (size_t)block_sz;
+		size_t x1 = x0 + (size_t)block_sz; if (x1 > width)  x1 = width;
+		size_t y1 = y0 + (size_t)block_sz; if (y1 > height) y1 = height;
+		unsigned char mask, rep[4];
+		int c, x, y;
+
+		if (p >= size) {
+			return QOIM_ERR_TRUNCATED;
+		}
+		mask = bytes[p++];
+		if ((unsigned char)(mask & (unsigned char)~qoim_mask_all(channels)) != 0) {
+			return QOIM_ERR_MASK; /* reserved/unknown mask bits */
+		}
+
+		for (c = 0; c < channels; c++) {
+			if (!(mask & (1 << c))) {
+				if (p >= size) {
+					return QOIM_ERR_TRUNCATED;
+				}
+				rep[c] = bytes[p++];
+			}
+		}
+
+		if (mask == 0) {
+			s_full++;
+		}
+
+		for (y = (int)y0; y < (int)y1; y++) {
+			for (x = (int)x0; x < (int)x1; x++) {
+				size_t out_idx = ((size_t)y * width + x) * (size_t)out_channels;
+				if (pixels && out_idx + (size_t)channels > pixel_cap) {
+					return QOIM_ERR_TRUNCATED;
+				}
+				for (c = 0; c < channels; c++) {
+					unsigned char v;
+					if (mask & (1 << c)) {
+						if (p >= size) {
+							return QOIM_ERR_TRUNCATED;
+						}
+						v = bytes[p++];
+					}
+					else {
+						v = rep[c];
+						s_hit_px++;
+					}
+					if (pixels) {
+						pixels[out_idx + (size_t)c] = v;
+					}
+				}
+				if (pixels && channels == 3 && out_channels == 4) {
+					if (out_idx + 4 > pixel_cap) {
+						return QOIM_ERR_TRUNCATED;
+					}
+					pixels[out_idx + 3] = 255;
+				}
+			}
+		}
+	}
+
+	/* The end marker must follow immediately; trailing bytes are rejected. */
+	if (p + (int)sizeof(qoi_padding) != size) {
+		return QOIM_ERR_ENDMARKER;
+	}
+	{
+		int e;
+		for (e = 0; e < (int)sizeof(qoi_padding); e++) {
+			if (bytes[p + e] != qoi_padding[e]) {
+				return QOIM_ERR_ENDMARKER;
+			}
+		}
+	}
+
+	if (hit_px_ch)   { *hit_px_ch = s_hit_px; }
+	if (total_px_ch) { *total_px_ch = (int)((size_t)width * height * channels); }
+	if (hit_blocks)  { *hit_blocks = s_full; }
+	if (total_blocks){ *total_blocks = (int)nb; }
+	return QOIM_OK;
+}
+
+void *qoim_encode(const void *data, const qoi_desc *desc,
+	const qoim_options *opt, int *out_len) {
+	unsigned int width, height;
+	int channels, block_sz, tolerance, p = 0;
+	size_t total_px, nblocks_x, nblocks_y, nb, max_size, bi;
+	unsigned char *bytes;
+	const unsigned char *pixels;
+
+	if (
+		data == NULL || out_len == NULL || desc == NULL || opt == NULL ||
+		desc->width == 0 || desc->height == 0 ||
+		desc->channels < 3 || desc->channels > 4 ||
+		desc->colorspace > 1 ||
+		opt->block_sz == 0 ||
+		desc->height >= QOI_PIXELS_MAX / desc->width
+	) {
+		return NULL;
+	}
+
+	width = desc->width;
+	height = desc->height;
+	channels = desc->channels;
+	block_sz = opt->block_sz;
+	tolerance = opt->tolerance;
+	pixels = (const unsigned char *)data;
+	total_px = (size_t)width * (size_t)height;
+	nblocks_x = ((size_t)width + (size_t)block_sz - 1) / (size_t)block_sz;
+	nblocks_y = ((size_t)height + (size_t)block_sz - 1) / (size_t)block_sz;
+	nb = nblocks_x * nblocks_y;
+
+	/* Worst case: header + per block (mask + one value per constant channel)
+	+ one verbatim byte per pixel per channel + end marker. */
+	max_size = (size_t)QOIM_HEADER_SIZE
+		+ nb * (1 + (size_t)channels)
+		+ total_px * (size_t)channels
+		+ sizeof(qoi_padding);
+
+	bytes = (unsigned char *)QOI_MALLOC(max_size);
+	if (!bytes) {
+		return NULL;
+	}
+
+	qoi_write_32(bytes, &p, QOIM_MAGIC);
+	qoi_write_32(bytes, &p, width);
+	qoi_write_32(bytes, &p, height);
+	bytes[p++] = (unsigned char)channels;
+	bytes[p++] = (unsigned char)block_sz;
+	bytes[p++] = (unsigned char)tolerance;
+	bytes[p++] = 0; /* reserved, must be zero */
+
+	for (bi = 0; bi < nb; bi++) {
+		size_t blk_col = bi % nblocks_x;
+		size_t blk_row = bi / nblocks_x;
+		size_t x0 = blk_col * (size_t)block_sz;
+		size_t y0 = blk_row * (size_t)block_sz;
+		size_t x1 = x0 + (size_t)block_sz; if (x1 > width)  x1 = width;
+		size_t y1 = y0 + (size_t)block_sz; if (y1 > height) y1 = height;
+
+		unsigned char mn[4], mx[4], rep[4];
+		unsigned char mask = 0;
+		unsigned int sum[4];
+		size_t cnt;
+		int c, x, y;
+
+		for (c = 0; c < channels; c++) {
+			mn[c] = 255;
+			mx[c] = 0;
+			sum[c] = 0;
+		}
+		cnt = 0;
+		for (y = (int)y0; y < (int)y1; y++) {
+			for (x = (int)x0; x < (int)x1; x++) {
+				const unsigned char *px = pixels +
+					((size_t)y * width + x) * (size_t)channels;
+				for (c = 0; c < channels; c++) {
+					unsigned char v = px[c];
+					if (v < mn[c]) mn[c] = v;
+					if (v > mx[c]) mx[c] = v;
+					sum[c] += v;
+				}
+				cnt++;
+			}
+		}
+
+		for (c = 0; c < channels; c++) {
+			/* rounded mean, half up */
+			rep[c] = (unsigned char)((sum[c] + cnt / 2) / cnt);
+			if ((int)mx[c] - (int)mn[c] > tolerance) {
+				mask |= (unsigned char)(1 << c);
+			}
+		}
+
+		bytes[p++] = mask;
+
+		/* constant channels: one representative value each */
+		for (c = 0; c < channels; c++) {
+			if (!(mask & (1 << c))) {
+				bytes[p++] = rep[c];
+			}
+		}
+
+		/* varying channels: verbatim per-pixel bytes, channel interleaved */
+		for (y = (int)y0; y < (int)y1; y++) {
+			for (x = (int)x0; x < (int)x1; x++) {
+				const unsigned char *px = pixels +
+					((size_t)y * width + x) * (size_t)channels;
+				for (c = 0; c < channels; c++) {
+					if (mask & (1 << c)) {
+						bytes[p++] = px[c];
+					}
+				}
+			}
+		}
+
+		/* Mask/data consistency guard: a channel advertised as constant must
+		have every block value within tolerance of the stored value. The
+		classification above guarantees this, but refuse to emit a stream that
+		violates its own block header rather than producing bad data. */
+		for (c = 0; c < channels; c++) {
+			if (!(mask & (1 << c))) {
+				for (y = (int)y0; y < (int)y1; y++) {
+					for (x = (int)x0; x < (int)x1; x++) {
+						unsigned char v = pixels[
+							((size_t)y * width + x) * (size_t)channels + c];
+						int d = (int)v - (int)rep[c];
+						if (d < 0) d = -d;
+						if (d > tolerance) {
+							QOI_FREE(bytes);
+							return NULL;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	{
+		int e;
+		for (e = 0; e < (int)sizeof(qoi_padding); e++) {
+			bytes[p++] = qoi_padding[e];
+		}
+	}
+
+	if ((size_t)p > max_size) {
+		QOI_FREE(bytes);
+		return NULL;
+	}
+
+	*out_len = p;
+	return bytes;
+}
+
+void *qoim_decode(const void *data, int size, qoi_desc *desc, int channels,
+	qoim_status *status) {
+	const unsigned char *bytes;
+	unsigned int header_magic, width, height;
+	unsigned char file_channels, block_sz, tolerance, reserved;
+	int out_channels;
+	int rp = 0;
+	unsigned char *pixels;
+	size_t px_len;
+	qoim_status st;
+
+	if (status) { *status = QOIM_ERR_ARG; }
+	if (
+		data == NULL || desc == NULL ||
+		(channels != 0 && channels != 3 && channels != 4) ||
+		size < QOIM_HEADER_SIZE + (int)sizeof(qoi_padding)
+	) {
+		return NULL;
+	}
+	bytes = (const unsigned char *)data;
+
+	header_magic = qoi_read_32(bytes, &rp);
+	width = qoi_read_32(bytes, &rp);
+	height = qoi_read_32(bytes, &rp);
+	file_channels = bytes[rp++];
+	block_sz = bytes[rp++];
+	tolerance = bytes[rp++];
+	reserved = bytes[rp++];
+
+	if (header_magic != QOIM_MAGIC) {
+		if (status) { *status = QOIM_ERR_MAGIC; }
+		return NULL;
+	}
+	if (
+		width == 0 || height == 0 ||
+		file_channels < 3 || file_channels > 4 ||
+		block_sz == 0 ||
+		reserved != 0 ||
+		height >= QOI_PIXELS_MAX / width
+	) {
+		if (status) { *status = QOIM_ERR_HEADER; }
+		return NULL;
+	}
+
+	out_channels = (channels == 0) ? file_channels : channels;
+
+	/* The block payload is interleaved in the stream's own channel count.
+	Upsampling RGB to RGBA (3 -> 4, filling alpha 255) is supported, but
+	dropping the alpha channel from an RGBA stream cannot be done safely on
+	this layout, so reject the downconvert explicitly. */
+	if (out_channels < file_channels) {
+		if (status) { *status = QOIM_ERR_ARG; }
+		return NULL;
+	}
+
+	/* Validate the whole structure without touching pixel memory first. A
+	crafted header (e.g. a block_sz that makes the declared block grid reach
+	beyond the truncated payload) must be rejected here rather than cause an
+	out-of-bounds write during reconstruction. */
+	st = qoim_walk(bytes, size, width, height, file_channels, block_sz,
+		out_channels, NULL, NULL, NULL, NULL, NULL);
+	if (st != QOIM_OK) {
+		if (status) { *status = st; }
+		return NULL;
+	}
+
+	px_len = (size_t)width * height * (size_t)out_channels;
+	pixels = (unsigned char *)QOI_MALLOC(px_len);
+	if (!pixels) {
+		if (status) { *status = QOIM_ERR_NOMEM; }
+		return NULL;
+	}
+
+	st = qoim_walk(bytes, size, width, height, file_channels, block_sz,
+		out_channels, pixels, NULL, NULL, NULL, NULL);
+	if (st != QOIM_OK) {
+		QOI_FREE(pixels);
+		if (status) { *status = st; }
+		return NULL;
+	}
+
+	desc->width = width;
+	desc->height = height;
+	desc->channels = file_channels;
+	desc->colorspace = QOI_SRGB;
+	(void)tolerance;
+	if (status) { *status = QOIM_OK; }
+	return pixels;
+}
+
+qoim_status qoim_check(const void *data, int size) {
+	const unsigned char *bytes;
+	unsigned int header_magic, width, height;
+	unsigned char file_channels, block_sz, reserved;
+	int rp = 0;
+
+	if (data == NULL || size < QOIM_HEADER_SIZE + (int)sizeof(qoi_padding)) {
+		return QOIM_ERR_ARG;
+	}
+	bytes = (const unsigned char *)data;
+
+	header_magic = qoi_read_32(bytes, &rp);
+	width = qoi_read_32(bytes, &rp);
+	height = qoi_read_32(bytes, &rp);
+	file_channels = bytes[rp++];
+	block_sz = bytes[rp++];
+	rp++; /* tolerance */
+	reserved = bytes[rp++];
+
+	if (header_magic != QOIM_MAGIC) { return QOIM_ERR_MAGIC; }
+	if (
+		width == 0 || height == 0 ||
+		file_channels < 3 || file_channels > 4 ||
+		block_sz == 0 ||
+		reserved != 0 ||
+		height >= QOI_PIXELS_MAX / width
+	) {
+		return QOIM_ERR_HEADER;
+	}
+
+	return qoim_walk(bytes, size, width, height, file_channels, block_sz,
+		file_channels, NULL, NULL, NULL, NULL, NULL);
+}
+
+qoim_status qoim_stats(const void *data, int size,
+	int *hit_channels, int *total_channels,
+	int *hit_blocks, int *total_blocks) {
+	const unsigned char *bytes;
+	unsigned int header_magic, width, height;
+	unsigned char file_channels, block_sz;
+	int rp = 0;
+	int hc = 0, tc = 0, hb = 0, tb = 0;
+	qoim_status st;
+
+	if (data == NULL || size < QOIM_HEADER_SIZE + (int)sizeof(qoi_padding)) {
+		return QOIM_ERR_ARG;
+	}
+	bytes = (const unsigned char *)data;
+
+	header_magic = qoi_read_32(bytes, &rp);
+	width = qoi_read_32(bytes, &rp);
+	height = qoi_read_32(bytes, &rp);
+	file_channels = bytes[rp++];
+	block_sz = bytes[rp++];
+	rp += 2; /* tolerance + reserved */
+
+	if (header_magic != QOIM_MAGIC) { return QOIM_ERR_MAGIC; }
+	if (
+		width == 0 || height == 0 ||
+		file_channels < 3 || file_channels > 4 ||
+		block_sz == 0 ||
+		height >= QOI_PIXELS_MAX / width
+	) {
+		return QOIM_ERR_HEADER;
+	}
+
+	st = qoim_walk(bytes, size, width, height, file_channels, block_sz,
+		file_channels, NULL, &hc, &tc, &hb, &tb);
+	if (st != QOIM_OK) {
+		return st;
+	}
+	if (hit_channels)   { *hit_channels = hc; }
+	if (total_channels) { *total_channels = tc; }
+	if (hit_blocks)     { *hit_blocks = hb; }
+	if (total_blocks)   { *total_blocks = tb; }
+	return QOIM_OK;
+}
+
 #endif /* QOI_IMPLEMENTATION */
