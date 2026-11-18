@@ -41,12 +41,22 @@ void *rgba_pixels = qoi_read("image.qoi", &desc, 4);
 -- Documentation
 
 This library provides the following functions;
-- qoi_read    -- read and decode a QOI file
-- qoi_decode  -- decode the raw bytes of a QOI image from memory
-- qoi_write   -- encode and write a QOI file
-- qoi_encode  -- encode an rgba buffer into a QOI image in memory
+- qoi_read          -- read and decode a QOI file
+- qoi_decode        -- decode the raw bytes of a QOI image from memory
+- qoi_decode_order  -- like qoi_decode, but with an explicit channel order
+- qoi_write         -- encode and write a QOI file
+- qoi_encode        -- encode an rgba buffer into a QOI image in memory
+- qoi_encode_order  -- like qoi_encode, but with an explicit channel order
 
 See the function declaration below for the signature and more information.
+
+The channel order argument selects the byte layout of the caller's pixel
+buffer. QOI_ORDER_RGB means the buffer is r,g,b (and a for 4 channels) and is
+the layout used by qoi_encode/qoi_decode. QOI_ORDER_BGR means the buffer is
+b,g,r (and a). It lets BGR/BGRA buffers be encoded and BGRA/BGR buffers be
+decoded directly, without an extra full image swap pass in the caller. The
+order never changes the QOI byte stream: it is always written and read in the
+canonical r,g,b,a layout described below.
 
 If you don't want/need the qoi_read and qoi_write functions, you can define
 QOI_NO_STDIO before including this library.
@@ -83,6 +93,13 @@ Pixels are encoded as
 
 The color channels are assumed to not be premultiplied with the alpha channel
 ("un-premultiplied alpha").
+
+The QOI stream itself always stores pixels as r,g,b (and a). The qoi_encode_order
+and qoi_decode_order functions take an additional channel order argument that
+describes the byte layout of the caller's pixel buffer only; it has no effect on
+the stream. This allows BGR/BGRA buffers to be encoded directly and BGRA/BGR
+output to be produced directly, without swapping the channels of the whole
+image beforehand.
 
 A running array[64] (zero-initialized) of previously seen pixel values is
 maintained by the encoder and decoder. Each pixel that is seen by the encoder
@@ -233,6 +250,20 @@ how chunks are en-/decoded. */
 #define QOI_SRGB   0
 #define QOI_LINEAR 1
 
+/* Channel order of the pixel buffer passed to qoi_encode_order() and returned
+from qoi_decode_order(). It describes the memory layout of a single pixel only;
+the QOI byte stream is always written and read in the canonical r,g,b[,a]
+order, so both orders produce byte-identical streams for the same image.
+
+	QOI_ORDER_RGB  r, g, b[, a] -- the layout of qoi_encode/qoi_decode
+	QOI_ORDER_BGR  b, g, r[, a] -- e.g. Windows DIBs, OpenGL GL_BGR(A)
+
+The alpha channel, when present, is the last byte in both orders. Any other
+value is invalid and makes the function return NULL. */
+
+#define QOI_ORDER_RGB 0
+#define QOI_ORDER_BGR 1
+
 typedef struct {
 	unsigned int width;
 	unsigned int height;
@@ -278,6 +309,21 @@ The returned qoi data should be free()d after use. */
 void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len);
 
 
+/* Encode raw RGB or RGBA pixels into a QOI image in memory, with the pixel
+buffer in the given channel order (QOI_ORDER_RGB or QOI_ORDER_BGR). For
+QOI_ORDER_RGB this is identical to qoi_encode(). For QOI_ORDER_BGR the
+buffer is read as b,g,r[,a]; the encoded stream is byte-for-byte identical
+to encoding the same image after swapping it to r,g,b[,a] by hand.
+
+Any other order value returns NULL, as do the invalid parameter cases of
+qoi_encode().
+
+The returned qoi data should be free()d after use. */
+
+void *qoi_encode_order(const void *data, const qoi_desc *desc, int order,
+	int *out_len);
+
+
 /* Decode a QOI image from memory.
 
 The function either returns NULL on failure (invalid parameters or malloc
@@ -287,6 +333,21 @@ is filled with the description from the file header.
 The returned pixel data should be free()d after use. */
 
 void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels);
+
+
+/* Decode a QOI image from memory, writing the pixels in the given channel
+order (QOI_ORDER_RGB or QOI_ORDER_BGR). For QOI_ORDER_RGB this is identical
+to qoi_decode(). For QOI_ORDER_BGR the output buffer is b,g,r[,a] and holds
+exactly the image that swapping the r and b channels of a QOI_ORDER_RGB
+decode afterwards produces.
+
+Any other order value returns NULL, as do the invalid parameter cases of
+qoi_decode().
+
+The returned pixel data should be free()d after use. */
+
+void *qoi_decode_order(const void *data, int size, qoi_desc *desc,
+	int channels, int order);
 
 
 #ifdef __cplusplus
@@ -354,8 +415,15 @@ static unsigned int qoi_read_32(const unsigned char *bytes, int *p) {
 }
 
 void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
+	return qoi_encode_order(data, desc, QOI_ORDER_RGB, out_len);
+}
+
+void *qoi_encode_order(const void *data, const qoi_desc *desc, int order,
+	int *out_len)
+{
 	int i, max_size, p, run;
 	int px_len, px_end, px_pos, channels;
+	int red_offset, blue_offset;
 	unsigned char *bytes;
 	const unsigned char *pixels;
 	qoi_rgba_t index[64];
@@ -363,6 +431,7 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 
 	if (
 		data == NULL || out_len == NULL || desc == NULL ||
+		(order != QOI_ORDER_RGB && order != QOI_ORDER_BGR) ||
 		desc->width == 0 || desc->height == 0 ||
 		desc->channels < 3 || desc->channels > 4 ||
 		desc->colorspace > 1 ||
@@ -370,6 +439,12 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	) {
 		return NULL;
 	}
+
+	/* Byte offsets of the red and blue channel in the caller's buffer. The
+	order only affects these two reads; every byte written to the stream is
+	the canonical r,g,b[,a]. */
+	red_offset = (order == QOI_ORDER_BGR) ? 2 : 0;
+	blue_offset = (order == QOI_ORDER_BGR) ? 0 : 2;
 
 	max_size =
 		desc->width * desc->height * (desc->channels + 1) +
@@ -404,9 +479,9 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	channels = desc->channels;
 
 	for (px_pos = 0; px_pos < px_len; px_pos += channels) {
-		px.rgba.r = pixels[px_pos + 0];
+		px.rgba.r = pixels[px_pos + red_offset];
 		px.rgba.g = pixels[px_pos + 1];
-		px.rgba.b = pixels[px_pos + 2];
+		px.rgba.b = pixels[px_pos + blue_offset];
 
 		if (channels == 4) {
 			px.rgba.a = pixels[px_pos + 3];
@@ -486,21 +561,35 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 }
 
 void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
+	return qoi_decode_order(data, size, desc, channels, QOI_ORDER_RGB);
+}
+
+void *qoi_decode_order(const void *data, int size, qoi_desc *desc,
+	int channels, int order)
+{
 	const unsigned char *bytes;
 	unsigned int header_magic;
 	unsigned char *pixels;
 	qoi_rgba_t index[64];
 	qoi_rgba_t px;
 	int px_len, chunks_len, px_pos;
+	int red_offset, blue_offset;
 	int p = 0, run = 0;
 
 	if (
 		data == NULL || desc == NULL ||
+		(order != QOI_ORDER_RGB && order != QOI_ORDER_BGR) ||
 		(channels != 0 && channels != 3 && channels != 4) ||
 		size < QOI_HEADER_SIZE + (int)sizeof(qoi_padding)
 	) {
 		return NULL;
 	}
+
+	/* Byte offsets of the red and blue channel in the output buffer. As in
+	the encoder, the order only affects where r and b are written; the alpha
+	channel is the last byte in both orders. */
+	red_offset = (order == QOI_ORDER_BGR) ? 2 : 0;
+	blue_offset = (order == QOI_ORDER_BGR) ? 0 : 2;
 
 	bytes = (const unsigned char *)data;
 
@@ -577,9 +666,9 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 			index[QOI_COLOR_HASH(px) & (64 - 1)] = px;
 		}
 
-		pixels[px_pos + 0] = px.rgba.r;
+		pixels[px_pos + red_offset] = px.rgba.r;
 		pixels[px_pos + 1] = px.rgba.g;
-		pixels[px_pos + 2] = px.rgba.b;
+		pixels[px_pos + blue_offset] = px.rgba.b;
 		
 		if (channels == 4) {
 			pixels[px_pos + 3] = px.rgba.a;
