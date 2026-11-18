@@ -69,6 +69,33 @@ Likewise, pull requests for performance improvements will probably not be accept
 either, as this "reference implementation" tries to be as easy to read as possible.
 
 
+## Determinism Testing
+
+To guard against undefined behavior producing different output across machines
+or compiler optimization levels, `qoidet.c` is a self-contained determinism
+checker for the encoder and decoder. It builds a fixed set of synthetic images
+(random data, long runs, gradients on the DIFF/LUMA thresholds, alpha
+transitions, signed-char wrap boundaries), hashes every encoded and decoded
+buffer with SHA-256, and reports the exact byte offset of any divergence.
+
+Run the full suite — 10000 iterations per process, three processes per build,
+across `-O0`/`-O2`/`-O3` and an UndefinedBehaviorSanitizer + AddressSanitizer
+build, plus byte-for-byte cross-build fixture comparison:
+
+```
+make determinism
+```
+
+The iteration count and compilers are configurable via `ITERS`, `CC` and `SC`.
+The checker can also be used directly:
+
+```
+make det
+./qoidet 10000              # repeated in-process encode/decode, hash each run
+./qoidet dump out-dir/      # write the fixed .qoi fixtures
+./qoidet cmp a.qoi b.qoi    # byte comparison, prints first differing offset
+```
+
 ## Tools
 
 - [floooh/qoiview](https://github.com/floooh/qoiview) - native QOI viewer
