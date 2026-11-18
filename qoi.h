@@ -278,6 +278,68 @@ The returned qoi data should be free()d after use. */
 void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len);
 
 
+/* Encode raw RGB or RGBA pixels into a QOI image with an optional,
+configurable color cache.
+
+cfg == NULL selects the defaults, which are exactly the original encoder:
+
+	cache_size   = 64
+	cache_policy = QOI_CACHE_FIXED
+	report       = 0
+
+The three parts are independently switchable. cache_size must be 0 (default,
+64), 16, 32 or 64; cache_policy must be QOI_CACHE_FIXED or QOI_CACHE_LRU;
+report must be 0 or 1.
+
+qoi_encode_cfg_valid() returns 1 for cfg == NULL and for valid
+configurations, 0 otherwise. qoi_encode_options() returns NULL and zeroes
+*stats (if non-NULL) when cfg is invalid; it returns NULL like qoi_encode()
+for invalid data/desc/out_len or allocation failure. Call
+qoi_encode_cfg_valid() first if the two failure kinds must be distinguished.
+
+With report == 1 and stats != NULL, *stats is filled with the cache
+configuration actually used and this encode's hit counts; index_hits is the
+number of pixels written as QOI_OP_INDEX. Otherwise *stats is zeroed.
+
+The cache state occupies a constant, image-independent amount of memory,
+bounded by QOI_CACHE_BYTES_MAX bytes (see stats->cache_bytes).
+
+QOI_CACHE_FIXED costs one slot lookup per pixel that misses the decoder
+mirror; QOI_CACHE_LRU additionally scans its resident entries, so it is
+slower but keeps colors that collide on the fixed slot assignment.
+
+With the default configuration the returned bytes are identical to those of
+qoi_encode(). The default configuration does not change the QOI bitstream and
+is readable by any QOI decoder. */
+
+#define QOI_CACHE_FIXED 0
+#define QOI_CACHE_LRU   1
+
+/* Compile-time upper bound for the encoder cache state, in bytes. */
+#define QOI_CACHE_BYTES_MAX 512
+
+typedef struct {
+	int cache_size;   /* 0 (default 64), 16, 32 or 64 */
+	int cache_policy; /* QOI_CACHE_FIXED or QOI_CACHE_LRU */
+	int report;       /* 0 = off, 1 = fill qoi_encode_stats */
+} qoi_encode_cfg;
+
+typedef struct {
+	unsigned long long pixels;        /* total pixels encoded */
+	unsigned long long index_lookups; /* pixels that consulted the cache */
+	unsigned long long index_hits;    /* of those, QOI_OP_INDEX hits */
+	double index_hit_rate;            /* index_hits / index_lookups, 0..1 */
+	unsigned int cache_size;          /* effective size (16, 32 or 64) */
+	unsigned int cache_policy;        /* effective policy */
+	unsigned int cache_bytes;         /* fixed cache memory, in bytes */
+} qoi_encode_stats;
+
+int qoi_encode_cfg_valid(const qoi_encode_cfg *cfg);
+
+void *qoi_encode_options(const void *data, const qoi_desc *desc, int *out_len,
+	const qoi_encode_cfg *cfg, qoi_encode_stats *stats);
+
+
 /* Decode a QOI image from memory.
 
 The function either returns NULL on failure (invalid parameters or malloc
@@ -479,6 +541,261 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 
 	for (i = 0; i < (int)sizeof(qoi_padding); i++) {
 		bytes[p++] = qoi_padding[i];
+	}
+
+	*out_len = p;
+	return bytes;
+}
+
+/* -----------------------------------------------------------------------------
+Implementation of the optional, configurable color cache.
+
+The QOI bitstream has no notion of a cache size or policy: a decoder always
+keeps 64 slots and updates slot (hash & 63) after every chunk. An encoder may
+therefore only emit QOI_OP_INDEX k when slot k of that 64-slot decoder table
+still holds the current pixel. mirror[64] tracks that table. slots[64] is the
+configurable residency cache (size 16/32/64, fixed slot or LRU); it only
+decides *whether* a hit is attempted, never which index is emitted.
+
+The state is always the full struct, independent of size, policy and image:
+512 bytes, checked against QOI_CACHE_BYTES_MAX at compile time. */
+
+typedef struct {
+	qoi_rgba_t mirror[64]; /* decoder's 64-slot table; always kept in sync */
+	qoi_rgba_t slots[64];  /* residency cache; first `size` entries used */
+} qoi_cache_t;
+
+typedef char qoi_cache_size_check[
+	sizeof(qoi_cache_t) <= QOI_CACHE_BYTES_MAX ? 1 : -1
+];
+
+static void qoi_cache_init(qoi_cache_t *cache) {
+	QOI_ZEROARR(cache->mirror);
+	QOI_ZEROARR(cache->slots);
+}
+
+/* Returns the residency slot holding px, or -1. Entries of the zero-initialized
+cache count as holding the zero color, exactly like the original encoder and
+like the decoder's bottomless zero-initialized table. */
+static int qoi_cache_find(const qoi_cache_t *cache, int size, int policy, qoi_rgba_t px) {
+	int i;
+	if (policy == QOI_CACHE_FIXED) {
+		int pos = (int)(QOI_COLOR_HASH(px) % (unsigned int)size);
+		return cache->slots[pos].v == px.v ? pos : -1;
+	}
+	for (i = 0; i < size; i++) {
+		if (cache->slots[i].v == px.v) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+/* Inserts px, making it the most recently used entry. With QOI_CACHE_FIXED the
+entry is determined by the hash; with QOI_CACHE_LRU it is moved to the front
+and the least recently used entry is evicted. */
+static void qoi_cache_store(qoi_cache_t *cache, int size, int policy, qoi_rgba_t px) {
+	int i, pos;
+	if (policy == QOI_CACHE_FIXED) {
+		pos = (int)(QOI_COLOR_HASH(px) % (unsigned int)size);
+		cache->slots[pos] = px;
+		return;
+	}
+	pos = qoi_cache_find(cache, size, policy, px);
+	if (pos < 0) {
+		pos = size - 1;
+	}
+	for (i = pos; i > 0; i--) {
+		cache->slots[i] = cache->slots[i - 1];
+	}
+	cache->slots[0] = px;
+}
+
+int qoi_encode_cfg_valid(const qoi_encode_cfg *cfg) {
+	if (cfg == NULL) {
+		return 1;
+	}
+	if (
+		cfg->cache_size != 0 && cfg->cache_size != 16 &&
+		cfg->cache_size != 32 && cfg->cache_size != 64
+	) {
+		return 0;
+	}
+	if (cfg->cache_policy != QOI_CACHE_FIXED && cfg->cache_policy != QOI_CACHE_LRU) {
+		return 0;
+	}
+	if (cfg->report != 0 && cfg->report != 1) {
+		return 0;
+	}
+	return 1;
+}
+
+void *qoi_encode_options(const void *data, const qoi_desc *desc, int *out_len,
+	const qoi_encode_cfg *cfg, qoi_encode_stats *stats)
+{
+	int i, max_size, p, run;
+	int px_len, px_end, px_pos, channels;
+	int cache_size, cache_policy, report;
+	unsigned char *bytes;
+	const unsigned char *pixels;
+	qoi_cache_t cache;
+	qoi_rgba_t px, px_prev;
+
+	if (stats != NULL) {
+		memset(stats, 0, sizeof(qoi_encode_stats));
+	}
+
+	if (
+		!qoi_encode_cfg_valid(cfg) ||
+		data == NULL || out_len == NULL || desc == NULL ||
+		desc->width == 0 || desc->height == 0 ||
+		desc->channels < 3 || desc->channels > 4 ||
+		desc->colorspace > 1 ||
+		desc->height >= QOI_PIXELS_MAX / desc->width
+	) {
+		return NULL;
+	}
+
+	cache_size = (cfg == NULL || cfg->cache_size == 0) ? 64 : cfg->cache_size;
+	cache_policy = cfg == NULL ? QOI_CACHE_FIXED : cfg->cache_policy;
+	report = cfg == NULL ? 0 : cfg->report;
+
+	max_size =
+		desc->width * desc->height * (desc->channels + 1) +
+		QOI_HEADER_SIZE + sizeof(qoi_padding);
+
+	p = 0;
+	bytes = (unsigned char *) QOI_MALLOC(max_size);
+	if (!bytes) {
+		return NULL;
+	}
+
+	qoi_write_32(bytes, &p, QOI_MAGIC);
+	qoi_write_32(bytes, &p, desc->width);
+	qoi_write_32(bytes, &p, desc->height);
+	bytes[p++] = desc->channels;
+	bytes[p++] = desc->colorspace;
+
+	pixels = (const unsigned char *)data;
+
+	qoi_cache_init(&cache);
+
+	if (stats != NULL && report) {
+		stats->pixels = (unsigned long long)desc->width * desc->height;
+		stats->cache_size = (unsigned int)cache_size;
+		stats->cache_policy = (unsigned int)cache_policy;
+		stats->cache_bytes = (unsigned int)sizeof(qoi_cache_t);
+	}
+
+	run = 0;
+	px_prev.rgba.r = 0;
+	px_prev.rgba.g = 0;
+	px_prev.rgba.b = 0;
+	px_prev.rgba.a = 255;
+	px = px_prev;
+
+	px_len = desc->width * desc->height * desc->channels;
+	px_end = px_len - desc->channels;
+	channels = desc->channels;
+
+	for (px_pos = 0; px_pos < px_len; px_pos += channels) {
+		px.rgba.r = pixels[px_pos + 0];
+		px.rgba.g = pixels[px_pos + 1];
+		px.rgba.b = pixels[px_pos + 2];
+
+		if (channels == 4) {
+			px.rgba.a = pixels[px_pos + 3];
+		}
+
+		if (px.v == px_prev.v) {
+			run++;
+			if (run == 62 || px_pos == px_end) {
+				bytes[p++] = QOI_OP_RUN | (run - 1);
+				run = 0;
+			}
+		}
+		else {
+			int mirror_pos;
+
+			if (run > 0) {
+				bytes[p++] = QOI_OP_RUN | (run - 1);
+				run = 0;
+			}
+
+			mirror_pos = QOI_COLOR_HASH(px) & (64 - 1);
+
+			if (stats != NULL && report) {
+				stats->index_lookups++;
+			}
+
+			/* The decoder mirror is the authority: an index may only be
+			emitted when slot (hash & 63) still holds px. Checking it first
+			also keeps the configurable cache off the critical path for
+			colors the mirror has already forgotten. */
+			if (
+				cache.mirror[mirror_pos].v == px.v &&
+				qoi_cache_find(&cache, cache_size, cache_policy, px) >= 0
+			) {
+				bytes[p++] = QOI_OP_INDEX | mirror_pos;
+				qoi_cache_store(&cache, cache_size, cache_policy, px);
+				if (stats != NULL && report) {
+					stats->index_hits++;
+				}
+			}
+			else {
+				cache.mirror[mirror_pos] = px;
+				qoi_cache_store(&cache, cache_size, cache_policy, px);
+
+				if (px.rgba.a == px_prev.rgba.a) {
+					signed char vr = px.rgba.r - px_prev.rgba.r;
+					signed char vg = px.rgba.g - px_prev.rgba.g;
+					signed char vb = px.rgba.b - px_prev.rgba.b;
+
+					signed char vg_r = vr - vg;
+					signed char vg_b = vb - vg;
+
+					if (
+						vr > -3 && vr < 2 &&
+						vg > -3 && vg < 2 &&
+						vb > -3 && vb < 2
+					) {
+						bytes[p++] = QOI_OP_DIFF | (vr + 2) << 4 | (vg + 2) << 2 | (vb + 2);
+					}
+					else if (
+						vg_r >  -9 && vg_r <  8 &&
+						vg   > -33 && vg   < 32 &&
+						vg_b >  -9 && vg_b <  8
+					) {
+						bytes[p++] = QOI_OP_LUMA     | (vg   + 32);
+						bytes[p++] = (vg_r + 8) << 4 | (vg_b +  8);
+					}
+					else {
+						bytes[p++] = QOI_OP_RGB;
+						bytes[p++] = px.rgba.r;
+						bytes[p++] = px.rgba.g;
+						bytes[p++] = px.rgba.b;
+					}
+				}
+				else {
+					bytes[p++] = QOI_OP_RGBA;
+					bytes[p++] = px.rgba.r;
+					bytes[p++] = px.rgba.g;
+					bytes[p++] = px.rgba.b;
+					bytes[p++] = px.rgba.a;
+				}
+			}
+		}
+		px_prev = px;
+	}
+
+	for (i = 0; i < (int)sizeof(qoi_padding); i++) {
+		bytes[p++] = qoi_padding[i];
+	}
+
+	if (stats != NULL && report) {
+		stats->index_hit_rate = stats->index_lookups
+			? (double)stats->index_hits / (double)stats->index_lookups
+			: 0.0;
 	}
 
 	*out_len = p;
