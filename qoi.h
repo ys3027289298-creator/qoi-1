@@ -301,6 +301,7 @@ Implementation */
 #ifdef QOI_IMPLEMENTATION
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #ifndef QOI_MALLOC
 	#define QOI_MALLOC(sz) malloc(sz)
@@ -319,38 +320,75 @@ Implementation */
 
 #define QOI_MASK_2    0xc0 /* 11000000 */
 
-#define QOI_COLOR_HASH(C) (C.rgba.r*3 + C.rgba.g*5 + C.rgba.b*7 + C.rgba.a*11)
+/* The on-disk format stores every multi-byte integer as big endian (network
+byte order). The helpers below read and write it one byte at a time, so the
+host's native byte order never matters. */
+
+#define QOI_COLOR_HASH(C) (C.r*3 + C.g*5 + C.b*7 + C.a*11)
 #define QOI_MAGIC \
-	(((unsigned int)'q') << 24 | ((unsigned int)'o') << 16 | \
-	 ((unsigned int)'i') <<  8 | ((unsigned int)'f'))
+	(((uint32_t)0x71 << 24) | ((uint32_t)0x6f << 16) | \
+	 ((uint32_t)0x69 <<  8) |  (uint32_t)0x66)
 #define QOI_HEADER_SIZE 14
 
 /* 2GB is the max file size that this implementation can safely handle. We guard
 against anything larger than that, assuming the worst case with 5 bytes per
 pixel, rounded down to a nice clean value. 400 million pixels ought to be
 enough for anybody. */
-#define QOI_PIXELS_MAX ((unsigned int)400000000)
+#define QOI_PIXELS_MAX ((uint32_t)400000000)
 
-typedef union {
-	struct { unsigned char r, g, b, a; } rgba;
-	unsigned int v;
+/* A pixel is held as four explicit byte channels plus a 32 bit packed form
+with a *documented* byte layout (R in the most significant byte, A in the
+least significant byte). Unlike the previous `union { struct; unsigned int; }`,
+this representation does not rely on the host's byte order or on the size of
+`unsigned int`: the packed value is always composed and decomposed byte by
+byte through qoi_rgba_pack()/qoi_rgba_unpack(), which are endian agnostic. */
+
+typedef struct {
+	uint8_t r, g, b, a;
 } qoi_rgba_t;
+
+/* Compile-time guard: a qoi_rgba_t must be exactly four bytes, so indexing
+the color table and copying pixels with plain assignment stays sound. */
+typedef char qoi_rgba_size_check[(sizeof(qoi_rgba_t) == 4) ? 1 : -1];
+
+static inline uint32_t qoi_rgba_pack(qoi_rgba_t c) {
+	return
+		((uint32_t)c.r << 24) |
+		((uint32_t)c.g << 16) |
+		((uint32_t)c.b <<  8) |
+		 (uint32_t)c.a;
+}
+
+static inline qoi_rgba_t qoi_rgba_unpack(uint32_t v) {
+	qoi_rgba_t c;
+	c.r = (uint8_t)(v >> 24);
+	c.g = (uint8_t)(v >> 16);
+	c.b = (uint8_t)(v >>  8);
+	c.a = (uint8_t)(v);
+	return c;
+}
+
+/* Pixel equality compares the explicit byte channels. It is independent of
+host endianness and of any struct padding. */
+static inline int qoi_rgba_eq(qoi_rgba_t x, qoi_rgba_t y) {
+	return x.r == y.r && x.g == y.g && x.b == y.b && x.a == y.a;
+}
 
 static const unsigned char qoi_padding[8] = {0,0,0,0,0,0,0,1};
 
-static void qoi_write_32(unsigned char *bytes, int *p, unsigned int v) {
-	bytes[(*p)++] = (0xff000000 & v) >> 24;
-	bytes[(*p)++] = (0x00ff0000 & v) >> 16;
-	bytes[(*p)++] = (0x0000ff00 & v) >> 8;
-	bytes[(*p)++] = (0x000000ff & v);
+static void qoi_write_32(unsigned char *bytes, int *p, uint32_t v) {
+	bytes[(*p)++] = (unsigned char)((v >> 24) & 0xff);
+	bytes[(*p)++] = (unsigned char)((v >> 16) & 0xff);
+	bytes[(*p)++] = (unsigned char)((v >>  8) & 0xff);
+	bytes[(*p)++] = (unsigned char)( v        & 0xff);
 }
 
-static unsigned int qoi_read_32(const unsigned char *bytes, int *p) {
-	unsigned int a = bytes[(*p)++];
-	unsigned int b = bytes[(*p)++];
-	unsigned int c = bytes[(*p)++];
-	unsigned int d = bytes[(*p)++];
-	return a << 24 | b << 16 | c << 8 | d;
+static uint32_t qoi_read_32(const unsigned char *bytes, int *p) {
+	uint32_t a = bytes[(*p)++];
+	uint32_t b = bytes[(*p)++];
+	uint32_t c = bytes[(*p)++];
+	uint32_t d = bytes[(*p)++];
+	return (a << 24) | (b << 16) | (c << 8) | d;
 }
 
 void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
@@ -393,10 +431,10 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	QOI_ZEROARR(index);
 
 	run = 0;
-	px_prev.rgba.r = 0;
-	px_prev.rgba.g = 0;
-	px_prev.rgba.b = 0;
-	px_prev.rgba.a = 255;
+	px_prev.r = 0;
+	px_prev.g = 0;
+	px_prev.b = 0;
+	px_prev.a = 255;
 	px = px_prev;
 
 	px_len = desc->width * desc->height * desc->channels;
@@ -404,15 +442,15 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	channels = desc->channels;
 
 	for (px_pos = 0; px_pos < px_len; px_pos += channels) {
-		px.rgba.r = pixels[px_pos + 0];
-		px.rgba.g = pixels[px_pos + 1];
-		px.rgba.b = pixels[px_pos + 2];
+		px.r = pixels[px_pos + 0];
+		px.g = pixels[px_pos + 1];
+		px.b = pixels[px_pos + 2];
 
 		if (channels == 4) {
-			px.rgba.a = pixels[px_pos + 3];
+			px.a = pixels[px_pos + 3];
 		}
 
-		if (px.v == px_prev.v) {
+		if (qoi_rgba_eq(px, px_prev)) {
 			run++;
 			if (run == 62 || px_pos == px_end) {
 				bytes[p++] = QOI_OP_RUN | (run - 1);
@@ -429,19 +467,22 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 
 			index_pos = QOI_COLOR_HASH(px) & (64 - 1);
 
-			if (index[index_pos].v == px.v) {
+			if (qoi_rgba_eq(index[index_pos], px)) {
 				bytes[p++] = QOI_OP_INDEX | index_pos;
 			}
 			else {
 				index[index_pos] = px;
 
-				if (px.rgba.a == px_prev.rgba.a) {
-					signed char vr = px.rgba.r - px_prev.rgba.r;
-					signed char vg = px.rgba.g - px_prev.rgba.g;
-					signed char vb = px.rgba.b - px_prev.rgba.b;
+				if (px.a == px_prev.a) {
+					/* int arithmetic: uint8_t promotes to int, so the
+					subtraction yields a signed difference in -255..255 with
+					no implementation-defined signed overflow. */
+					int vr = (int)px.r - (int)px_prev.r;
+					int vg = (int)px.g - (int)px_prev.g;
+					int vb = (int)px.b - (int)px_prev.b;
 
-					signed char vg_r = vr - vg;
-					signed char vg_b = vb - vg;
+					int vg_r = vr - vg;
+					int vg_b = vb - vg;
 
 					if (
 						vr > -3 && vr < 2 &&
@@ -460,17 +501,17 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 					}
 					else {
 						bytes[p++] = QOI_OP_RGB;
-						bytes[p++] = px.rgba.r;
-						bytes[p++] = px.rgba.g;
-						bytes[p++] = px.rgba.b;
+						bytes[p++] = px.r;
+						bytes[p++] = px.g;
+						bytes[p++] = px.b;
 					}
 				}
 				else {
 					bytes[p++] = QOI_OP_RGBA;
-					bytes[p++] = px.rgba.r;
-					bytes[p++] = px.rgba.g;
-					bytes[p++] = px.rgba.b;
-					bytes[p++] = px.rgba.a;
+					bytes[p++] = px.r;
+					bytes[p++] = px.g;
+					bytes[p++] = px.b;
+					bytes[p++] = px.a;
 				}
 			}
 		}
@@ -487,7 +528,7 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 
 void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 	const unsigned char *bytes;
-	unsigned int header_magic;
+	uint32_t header_magic;
 	unsigned char *pixels;
 	qoi_rgba_t index[64];
 	qoi_rgba_t px;
@@ -531,10 +572,10 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 	}
 
 	QOI_ZEROARR(index);
-	px.rgba.r = 0;
-	px.rgba.g = 0;
-	px.rgba.b = 0;
-	px.rgba.a = 255;
+	px.r = 0;
+	px.g = 0;
+	px.b = 0;
+	px.a = 255;
 
 	chunks_len = size - (int)sizeof(qoi_padding);
 	for (px_pos = 0; px_pos < px_len; px_pos += channels) {
@@ -545,30 +586,30 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 			int b1 = bytes[p++];
 
 			if (b1 == QOI_OP_RGB) {
-				px.rgba.r = bytes[p++];
-				px.rgba.g = bytes[p++];
-				px.rgba.b = bytes[p++];
+				px.r = bytes[p++];
+				px.g = bytes[p++];
+				px.b = bytes[p++];
 			}
 			else if (b1 == QOI_OP_RGBA) {
-				px.rgba.r = bytes[p++];
-				px.rgba.g = bytes[p++];
-				px.rgba.b = bytes[p++];
-				px.rgba.a = bytes[p++];
+				px.r = bytes[p++];
+				px.g = bytes[p++];
+				px.b = bytes[p++];
+				px.a = bytes[p++];
 			}
 			else if ((b1 & QOI_MASK_2) == QOI_OP_INDEX) {
 				px = index[b1];
 			}
 			else if ((b1 & QOI_MASK_2) == QOI_OP_DIFF) {
-				px.rgba.r += ((b1 >> 4) & 0x03) - 2;
-				px.rgba.g += ((b1 >> 2) & 0x03) - 2;
-				px.rgba.b += ( b1       & 0x03) - 2;
+				px.r += ((b1 >> 4) & 0x03) - 2;
+				px.g += ((b1 >> 2) & 0x03) - 2;
+				px.b += ( b1       & 0x03) - 2;
 			}
 			else if ((b1 & QOI_MASK_2) == QOI_OP_LUMA) {
 				int b2 = bytes[p++];
 				int vg = (b1 & 0x3f) - 32;
-				px.rgba.r += vg - 8 + ((b2 >> 4) & 0x0f);
-				px.rgba.g += vg;
-				px.rgba.b += vg - 8 +  (b2       & 0x0f);
+				px.r += vg - 8 + ((b2 >> 4) & 0x0f);
+				px.g += vg;
+				px.b += vg - 8 +  (b2       & 0x0f);
 			}
 			else if ((b1 & QOI_MASK_2) == QOI_OP_RUN) {
 				run = (b1 & 0x3f);
@@ -577,12 +618,12 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 			index[QOI_COLOR_HASH(px) & (64 - 1)] = px;
 		}
 
-		pixels[px_pos + 0] = px.rgba.r;
-		pixels[px_pos + 1] = px.rgba.g;
-		pixels[px_pos + 2] = px.rgba.b;
+		pixels[px_pos + 0] = px.r;
+		pixels[px_pos + 1] = px.g;
+		pixels[px_pos + 2] = px.b;
 		
 		if (channels == 4) {
-			pixels[px_pos + 3] = px.rgba.a;
+			pixels[px_pos + 3] = px.a;
 		}
 	}
 
