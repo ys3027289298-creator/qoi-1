@@ -47,9 +47,28 @@ enough storage space.
 
 This particular implementation of QOI however is limited to images with a 
 maximum size of 400 million pixels. It will safely refuse to en-/decode anything
-larger than that. This is not a streaming en-/decoder. It loads the whole image
-file into RAM before doing any work and is not extensively optimized for 
+larger than that. qoi_encode()/qoi_read() are not streaming: they load the whole
+image file into RAM before doing any work and are not extensively optimized for 
 performance (but it's still very fast).
+
+The encoder has a streaming form for memory constrained machines. `qoi_stream_*`
+in [qoi.h](qoi.h) encodes in bounded memory, and [qoistream.c](qoistream.c) is a
+driver that keeps the whole process inside a hard per-job allowance:
+
+```sh
+make stream
+./qoistream --input frame.raw --width 7680 --height 4320 --quota-mb 512
+```
+
+It reads the input in chunks and writes the output as numbered fragments, which
+are concatenated in order afterwards; the result is byte-for-byte identical to
+qoi_encode() on the whole image. The chunk, staging buffer and fragment sizes
+are derived from `--quota`, the memory watermark is printed on every run, and a
+fragment boundary also writes an encoder checkpoint, so a run that is killed
+resumes from its last completed fragment — with a different quota if the retry
+has a different one. `sh tests/run_tests.sh` checks all of this on an 8K image
+across five quotas, including running the encoder under `ulimit -v` equal to
+the quota.
 
 If this is a limitation for your use case, please look into any of the other 
 implementations listed below.

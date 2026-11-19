@@ -3,11 +3,14 @@ CFLAGS_BENCH ?= -std=gnu99 -O3
 LFLAGS_BENCH ?= -lpng $(LDFLAGS)
 CFLAGS_CONV ?= -std=c99 -O3
 LFLAGS_CONV ?= $(LDFLAGS)
+CFLAGS_STREAM ?= -std=gnu99 -O2 -Wall -Wextra
+LFLAGS_STREAM ?= $(LDFLAGS)
 
 TARGET_BENCH ?= qoibench
 TARGET_CONV ?= qoiconv
+TARGET_STREAM ?= qoistream
 
-all: $(TARGET_BENCH) $(TARGET_CONV)
+all: $(TARGET_BENCH) $(TARGET_CONV) $(TARGET_STREAM)
 
 bench: $(TARGET_BENCH)
 $(TARGET_BENCH):$(TARGET_BENCH).c qoi.h
@@ -17,6 +20,13 @@ conv: $(TARGET_CONV)
 $(TARGET_CONV):$(TARGET_CONV).c qoi.h
 	$(CC) $(CFLAGS_CONV) $(CFLAGS) $(TARGET_CONV).c -o $(TARGET_CONV) $(LFLAGS_CONV)
 
-.PHONY: clean
+stream: $(TARGET_STREAM)
+$(TARGET_STREAM):$(TARGET_STREAM).c qoi.h
+	$(CC) $(CFLAGS_STREAM) $(CFLAGS) $(TARGET_STREAM).c -o $(TARGET_STREAM) $(LFLAGS_STREAM)
+
+.PHONY: test clean
+test:
+	sh tests/run_tests.sh
+
 clean:
-	$(RM) $(TARGET_BENCH) $(TARGET_CONV)
+	$(RM) $(TARGET_BENCH) $(TARGET_CONV) $(TARGET_STREAM)

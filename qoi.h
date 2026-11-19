@@ -41,10 +41,14 @@ void *rgba_pixels = qoi_read("image.qoi", &desc, 4);
 -- Documentation
 
 This library provides the following functions;
-- qoi_read    -- read and decode a QOI file
-- qoi_decode  -- decode the raw bytes of a QOI image from memory
-- qoi_write   -- encode and write a QOI file
-- qoi_encode  -- encode an rgba buffer into a QOI image in memory
+- qoi_read         -- read and decode a QOI file
+- qoi_decode       -- decode the raw bytes of a QOI image from memory
+- qoi_write        -- encode and write a QOI file
+- qoi_encode       -- encode an rgba buffer into a QOI image in memory
+- qoi_stream_init  -- start an encoder that writes output through a sink
+- qoi_stream_feed  -- feed raw pixels to a streaming encoder, in any chunks
+- qoi_stream_end   -- finish a streaming encoder
+- qoi_stream_save_state / qoi_stream_load_state -- resume a stream later
 
 See the function declaration below for the signature and more information.
 
@@ -56,6 +60,39 @@ you can define QOI_MALLOC and QOI_FREE before including this library.
 
 This library uses memset() to zero-initialize the index. To supply your own
 implementation you can define QOI_ZEROARR before including this library.
+
+
+-- Streaming Encoding
+
+The functions above take the whole image in memory, which is a problem for
+very large images on memory constrained machines: a 7680x4320 RGBA image alone
+is 126 MiB, and qoi_encode() additionally allocates the worst-case output
+buffer (5 bytes per pixel, another 158 MiB).
+
+The streaming API encodes in bounded, caller-controlled memory:
+
+	qoi_stream_encoder enc;
+	qoi_stream_init(&enc, &desc, out_buf, sizeof(out_buf), sink, user);
+	qoi_stream_feed(&enc, pixels, sizeof(pixels));  // any number of times
+	qoi_stream_end(&enc);
+
+qoi_stream_feed() accepts any number of bytes, including a partial pixel; it
+carries the unfinished pixel over to the next call. The encoder state (the
+64-slot index, the previous pixel and the pending run) is carried across
+feed calls, so the byte stream is independent of how the input is split.
+Concatenating everything passed to the sink is byte-for-byte identical to
+qoi_encode() on the same image.
+
+For resumable encoding, qoi_stream_save_state() serializes the complete
+encoder state into a small fixed-size blob (QOI_STREAM_STATE_SIZE bytes) and
+qoi_stream_load_state() restores it into a fresh encoder. A process that has
+to stop can flush, save the state and the number of bytes already emitted,
+and later resume by feeding the remaining pixels to a loaded encoder. The
+restored stream continues exactly where it left off.
+
+The library itself only ever uses the encoder struct (336 bytes on a
+32/64-bit little-endian build with natural alignment) and the caller supplied
+staging buffer; qoi_stream_feed() never allocates.
 
 
 -- Data Format
@@ -289,6 +326,113 @@ The returned pixel data should be free()d after use. */
 void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels);
 
 
+/* -----------------------------------------------------------------------------
+Streaming encoder
+
+The streaming API produces exactly the same byte stream as qoi_encode(), while
+never holding more than a caller controlled amount of working memory. The
+encoder emits bytes to a caller supplied sink as they are produced; the sink
+receives a pointer and a length and must copy or write the bytes before it
+returns (buffers passed to the sink are only valid until the call returns).
+
+All functions return 0 on success and a negative value on failure. */
+
+typedef union {
+	struct { unsigned char r, g, b, a; } rgba;
+	unsigned int v;
+} qoi_rgba_t;
+
+/* The sink must return 0 on success; any other value aborts the stream and is
+reported as QOI_STREAM_SINK_FAILED. */
+typedef int (*qoi_stream_sink)(void *user, const void *bytes, int len);
+
+typedef struct {
+	/* Fixed, self-contained encoder state. Do not access the members. */
+	unsigned int width;
+	unsigned int height;
+	unsigned char channels;
+	unsigned char colorspace;
+
+	int px_pos;                  /* file offset of the pixel being assembled */
+	int px_len;                  /* width * height * channels */
+	int px_end;
+	int err;                     /* sticky error flag */
+
+	qoi_rgba_t index[64];
+
+	unsigned char px_cur[4];     /* partial pixel carried between feeds */
+	int px_have;                 /* bytes held in px_cur */
+
+	qoi_rgba_t px_prev;
+	int run;
+
+	/* Output staging. The sink is called whenever the buffer is full. */
+	unsigned char *buf;
+	int buf_cap;
+	int buf_len;
+	qoi_stream_sink sink;
+	void *user;
+} qoi_stream_encoder;
+
+/* Bytes needed to serialize a complete encoder state with
+qoi_stream_save_state(), for any image size. Versions are rejected rather
+than misread, so this may grow in a future release. */
+#define QOI_STREAM_STATE_SIZE 308
+
+/* The staging buffer must hold at least this many bytes. */
+#define QOI_STREAM_MIN_BUF 32
+
+/* Prepare a streaming encoder for the image described by desc. Encoded bytes
+are handed to sink(user, bytes, len); outputs smaller than the full image are
+not buffered anywhere else. buf/buf_cap is the staging buffer used to batch
+sink calls; a staging buffer of at least QOI_STREAM_MIN_BUF (32) bytes is required, and a larger
+buffer simply means fewer sink calls. The encoder does not allocate anything.
+
+If desc is invalid (see qoi_encode) or sink is NULL or buf_cap is too small,
+QOI_STREAM_BAD_ARG is returned. */
+#define QOI_STREAM_BAD_ARG  (-1)
+#define QOI_STREAM_SINK_FAILED (-2)
+
+int qoi_stream_init(
+	qoi_stream_encoder *enc, const qoi_desc *desc,
+	void *buf, int buf_cap, qoi_stream_sink sink, void *user
+);
+
+/* Feed up to len bytes of raw pixels (in the layout described by desc,
+channels*1 bytes per pixel) to the encoder. len may cut a pixel in half; the
+partial pixel is completed by the next call. The number of bytes accepted is
+returned through *consumed (which may be less than len only on error). */
+int qoi_stream_feed(
+	qoi_stream_encoder *enc, const void *data, int len, int *consumed
+);
+
+/* Finish the stream: flush the pending run, append the 8 byte end marker and
+flush the staging buffer to the sink. The encoder must not be fed afterwards.
+Returns QOI_STREAM_BAD_ARG if fewer than width*height*channels bytes were
+fed. */
+int qoi_stream_end(qoi_stream_encoder *enc);
+
+/* Flush staged output to the sink without ending the stream. A caller that
+wants to persist progress and resume later should call this before
+qoi_stream_save_state() and before reading its own output byte count. */
+int qoi_stream_flush(qoi_stream_encoder *enc);
+
+/* Serialize the encoder state into out, which must hold at least
+QOI_STREAM_STATE_SIZE bytes, and restore it into a freshly initialized encoder
+(two encoders loaded from the same state resume with separate staging
+buffers). save returns the number of bytes written; it flushes staged output
+to the sink first, so after it returns everything encoded so far is durable.
+The state captures the pixel position, index, previous pixel and pending run.
+*/
+int qoi_stream_save_state(qoi_stream_encoder *enc, void *out, int out_len);
+int qoi_stream_load_state(qoi_stream_encoder *enc, const void *state, int len);
+
+/* Number of input bytes (pixel data, header excluded) consumed by the encoder.
+This includes the bytes of a partially assembled pixel, so it is exactly the
+offset at which a resumed encoder has to continue reading its input. */
+int qoi_stream_consumed(const qoi_stream_encoder *enc);
+
+
 #ifdef __cplusplus
 }
 #endif
@@ -330,11 +474,6 @@ against anything larger than that, assuming the worst case with 5 bytes per
 pixel, rounded down to a nice clean value. 400 million pixels ought to be
 enough for anybody. */
 #define QOI_PIXELS_MAX ((unsigned int)400000000)
-
-typedef union {
-	struct { unsigned char r, g, b, a; } rgba;
-	unsigned int v;
-} qoi_rgba_t;
 
 static const unsigned char qoi_padding[8] = {0,0,0,0,0,0,0,1};
 
@@ -588,6 +727,422 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 
 	return pixels;
 }
+
+
+int qoi_stream_init(
+	qoi_stream_encoder *enc, const qoi_desc *desc,
+	void *buf, int buf_cap, qoi_stream_sink sink, void *user
+) {
+	int p = 0;
+
+	if (
+		enc == NULL || desc == NULL || buf == NULL || sink == NULL ||
+		desc->width == 0 || desc->height == 0 ||
+		desc->channels < 3 || desc->channels > 4 ||
+		desc->colorspace > 1 ||
+		desc->height >= QOI_PIXELS_MAX / desc->width ||
+		buf_cap < QOI_STREAM_MIN_BUF
+	) {
+		return QOI_STREAM_BAD_ARG;
+	}
+
+	memset(enc, 0, sizeof(*enc));
+	enc->width = desc->width;
+	enc->height = desc->height;
+	enc->channels = desc->channels;
+	enc->colorspace = desc->colorspace;
+	enc->px_len = desc->width * desc->height * desc->channels;
+	enc->px_end = enc->px_len - desc->channels;
+	enc->buf = (unsigned char *)buf;
+	enc->buf_cap = buf_cap;
+	enc->sink = sink;
+	enc->user = user;
+
+	enc->px_prev.rgba.r = 0;
+	enc->px_prev.rgba.g = 0;
+	enc->px_prev.rgba.b = 0;
+	enc->px_prev.rgba.a = 255;
+	enc->px_cur[3] = 255; /* channels == 3 keeps alpha at 255, as in qoi_encode */
+	enc->run = 0;
+	enc->px_pos = 0;
+	enc->px_have = 0;
+	enc->err = 0;
+	QOI_ZEROARR(enc->index);
+
+	qoi_write_32(enc->buf, &p, QOI_MAGIC);
+	qoi_write_32(enc->buf, &p, desc->width);
+	qoi_write_32(enc->buf, &p, desc->height);
+	enc->buf[p++] = desc->channels;
+	enc->buf[p++] = desc->colorspace;
+	enc->buf_len = p;
+
+	return 0;
+}
+
+
+int qoi_stream_flush(qoi_stream_encoder *enc) {
+	if (enc == NULL) {
+		return QOI_STREAM_BAD_ARG;
+	}
+	if (enc->err) {
+		return enc->err;
+	}
+	if (enc->buf_len > 0) {
+		int len = enc->buf_len;
+		enc->buf_len = 0;
+		if (enc->sink(enc->user, enc->buf, len) != 0) {
+			enc->err = QOI_STREAM_SINK_FAILED;
+		}
+	}
+	return enc->err;
+}
+
+
+/* Make room for the largest possible step: one byte to flush a pending run
+followed by a full QOI_OP_RGBA chunk (5 bytes). The staging buffer is at least
+QOI_STREAM_MIN_BUF bytes, so this always succeeds. */
+static int qoi_stream_room(qoi_stream_encoder *enc) {
+	if (enc->buf_cap - enc->buf_len < 6) {
+		return qoi_stream_flush(enc);
+	}
+	return enc->err;
+}
+
+
+/* Encode one complete pixel. This is the body of the qoi_encode() loop,
+restated over the carried-over encoder state. */
+static int qoi_stream_pixel(qoi_stream_encoder *enc, const unsigned char *pixel) {
+	unsigned char *out;
+	int p;
+	qoi_rgba_t px, px_prev;
+	int run = enc->run;
+
+	if (qoi_stream_room(enc) != 0) {
+		return enc->err;
+	}
+	out = enc->buf + enc->buf_len;
+	p = 0;
+
+	px.rgba.r = pixel[0];
+	px.rgba.g = pixel[1];
+	px.rgba.b = pixel[2];
+	if (enc->channels == 4) {
+		px.rgba.a = pixel[3];
+	}
+	else {
+		px.rgba.a = 255;
+	}
+	px_prev = enc->px_prev;
+
+	if (px.v == px_prev.v) {
+		run++;
+		if (run == 62 || enc->px_pos == enc->px_end) {
+			out[p++] = QOI_OP_RUN | (run - 1);
+			run = 0;
+		}
+	}
+	else {
+		int index_pos;
+
+		if (run > 0) {
+			out[p++] = QOI_OP_RUN | (run - 1);
+			run = 0;
+		}
+
+		index_pos = QOI_COLOR_HASH(px) & (64 - 1);
+
+		if (enc->index[index_pos].v == px.v) {
+			out[p++] = QOI_OP_INDEX | index_pos;
+		}
+		else {
+			enc->index[index_pos] = px;
+
+			if (px.rgba.a == px_prev.rgba.a) {
+				signed char vr = px.rgba.r - px_prev.rgba.r;
+				signed char vg = px.rgba.g - px_prev.rgba.g;
+				signed char vb = px.rgba.b - px_prev.rgba.b;
+
+				signed char vg_r = vr - vg;
+				signed char vg_b = vb - vg;
+
+				if (
+					vr > -3 && vr < 2 &&
+					vg > -3 && vg < 2 &&
+					vb > -3 && vb < 2
+				) {
+					out[p++] = QOI_OP_DIFF | (vr + 2) << 4 | (vg + 2) << 2 | (vb + 2);
+				}
+				else if (
+					vg_r >  -9 && vg_r <  8 &&
+					vg   > -33 && vg   < 32 &&
+					vg_b >  -9 && vg_b <  8
+				) {
+					out[p++] = QOI_OP_LUMA     | (vg   + 32);
+					out[p++] = (vg_r + 8) << 4 | (vg_b +  8);
+				}
+				else {
+					out[p++] = QOI_OP_RGB;
+					out[p++] = px.rgba.r;
+					out[p++] = px.rgba.g;
+					out[p++] = px.rgba.b;
+				}
+			}
+			else {
+				out[p++] = QOI_OP_RGBA;
+				out[p++] = px.rgba.r;
+				out[p++] = px.rgba.g;
+				out[p++] = px.rgba.b;
+				out[p++] = px.rgba.a;
+			}
+		}
+	}
+
+	enc->buf_len += p;
+	enc->run = run;
+	enc->px_prev = px;
+	return 0;
+}
+
+
+int qoi_stream_feed(
+	qoi_stream_encoder *enc, const void *data, int len, int *consumed
+) {
+	const unsigned char *in = (const unsigned char *)data;
+	int i = 0;
+
+	if (consumed) {
+		*consumed = 0;
+	}
+	if (enc == NULL || (data == NULL && len > 0) || len < 0) {
+		return QOI_STREAM_BAD_ARG;
+	}
+	if (enc->err) {
+		return enc->err;
+	}
+	if (len == 0) {
+		return 0;
+	}
+	if (enc->px_pos >= enc->px_len) {
+		/* Already complete: extra input would be silently dropped, so reject. */
+		return QOI_STREAM_BAD_ARG;
+	}
+
+	while (i < len) {
+		int need = enc->channels - enc->px_have;
+		int avail = len - i;
+		int take = need < avail ? need : avail;
+
+		if (take > 0) {
+			memcpy(enc->px_cur + enc->px_have, in + i, take);
+			enc->px_have += take;
+			i += take;
+		}
+		if (enc->px_have < enc->channels) {
+			break;
+		}
+
+		if (qoi_stream_pixel(enc, enc->px_cur) != 0) {
+			break;
+		}
+		enc->px_have = 0;
+		enc->px_pos += enc->channels;
+
+		if (enc->px_pos >= enc->px_len) {
+			/* Trailing bytes beyond the last pixel are rejected. */
+			if (i < len) {
+				if (consumed) {
+					*consumed = i;
+				}
+				return QOI_STREAM_BAD_ARG;
+			}
+			break;
+		}
+	}
+
+	if (consumed) {
+		*consumed = i;
+	}
+	return enc->err;
+}
+
+
+int qoi_stream_end(qoi_stream_encoder *enc) {
+	int p;
+
+	if (enc == NULL) {
+		return QOI_STREAM_BAD_ARG;
+	}
+	if (enc->err) {
+		return enc->err;
+	}
+	if (enc->px_have != 0 || enc->px_pos != enc->px_len) {
+		return QOI_STREAM_BAD_ARG;
+	}
+
+	/* As in qoi_encode(), a run is always emitted by the last pixel, so this
+	is a safety net rather than a normal path. It must still go out before the
+	end marker, even if staging already failed. */
+	if (enc->run > 0) {
+		if (qoi_stream_room(enc) != 0) {
+			return enc->err;
+		}
+		enc->buf[enc->buf_len++] = QOI_OP_RUN | (enc->run - 1);
+		enc->run = 0;
+	}
+
+	if (enc->buf_cap - enc->buf_len < (int)sizeof(qoi_padding)) {
+		if (qoi_stream_flush(enc) != 0) {
+			return enc->err;
+		}
+	}
+	for (p = 0; p < (int)sizeof(qoi_padding); p++) {
+		enc->buf[enc->buf_len++] = qoi_padding[p];
+	}
+
+	return qoi_stream_flush(enc);
+}
+
+
+int qoi_stream_consumed(const qoi_stream_encoder *enc) {
+	if (enc == NULL) {
+		return 0;
+	}
+	return enc->px_pos + enc->px_have;
+}
+
+
+#define QOI_STREAM_STATE_MAGIC 0x71737431u /* "qst1" */
+
+static void qoi_stream_put_32(unsigned char *b, int *p, unsigned int v) {
+	b[(*p)++] = (unsigned char)(v & 0xff);
+	b[(*p)++] = (unsigned char)((v >> 8) & 0xff);
+	b[(*p)++] = (unsigned char)((v >> 16) & 0xff);
+	b[(*p)++] = (unsigned char)((v >> 24) & 0xff);
+}
+
+static unsigned int qoi_stream_get_32(const unsigned char *b, int *p) {
+	unsigned int v = (unsigned int)b[*p];
+	v |= (unsigned int)b[*p + 1] << 8;
+	v |= (unsigned int)b[*p + 2] << 16;
+	v |= (unsigned int)b[*p + 3] << 24;
+	*p += 4;
+	return v;
+}
+
+static unsigned int qoi_stream_state_hash(const unsigned char *b, int len) {
+	unsigned int h = 2166136261u;
+	int i;
+	for (i = 0; i < len; i++) {
+		h ^= b[i];
+		h *= 16777619u;
+	}
+	return h;
+}
+
+
+int qoi_stream_save_state(qoi_stream_encoder *enc, void *out, int out_len) {
+	unsigned char *b = (unsigned char *)out;
+	int p = 0, i;
+
+	if (enc == NULL || out == NULL || out_len < QOI_STREAM_STATE_SIZE) {
+		return QOI_STREAM_BAD_ARG;
+	}
+	if (enc->err) {
+		return enc->err;
+	}
+	/* Everything staged so far must reach the sink before the caller records
+	the output offset and persists the state. */
+	if (qoi_stream_flush(enc) != 0) {
+		return enc->err;
+	}
+
+	qoi_stream_put_32(b, &p, QOI_STREAM_STATE_MAGIC);
+	qoi_stream_put_32(b, &p, enc->width);
+	qoi_stream_put_32(b, &p, enc->height);
+	qoi_stream_put_32(b, &p, enc->channels);
+	qoi_stream_put_32(b, &p, enc->colorspace);
+	qoi_stream_put_32(b, &p, (unsigned int)enc->px_pos);
+	qoi_stream_put_32(b, &p, (unsigned int)enc->px_len);
+	qoi_stream_put_32(b, &p, (unsigned int)enc->px_end);
+	qoi_stream_put_32(b, &p, (unsigned int)enc->run);
+	qoi_stream_put_32(b, &p, (unsigned int)enc->px_have);
+	for (i = 0; i < 4; i++) {
+		b[p++] = enc->px_cur[i];
+	}
+	qoi_stream_put_32(b, &p, enc->px_prev.v);
+	for (i = 0; i < 64; i++) {
+		qoi_stream_put_32(b, &p, enc->index[i].v);
+	}
+	qoi_stream_put_32(b, &p, qoi_stream_state_hash(b, p));
+	/* p == QOI_STREAM_STATE_SIZE */
+	return p;
+}
+
+
+int qoi_stream_load_state(qoi_stream_encoder *enc, const void *state, int len) {
+	const unsigned char *b = (const unsigned char *)state;
+	unsigned int width, height, channels, colorspace;
+	unsigned int px_pos, px_len, px_end, run, px_have, hash;
+	unsigned char px_cur[4];
+	qoi_rgba_t px_prev;
+	qoi_rgba_t index[64];
+	int p = 0, i;
+
+	if (enc == NULL || state == NULL || len < QOI_STREAM_STATE_SIZE) {
+		return QOI_STREAM_BAD_ARG;
+	}
+	if (qoi_stream_get_32(b, &p) != QOI_STREAM_STATE_MAGIC) {
+		return QOI_STREAM_BAD_ARG;
+	}
+	width = qoi_stream_get_32(b, &p);
+	height = qoi_stream_get_32(b, &p);
+	channels = qoi_stream_get_32(b, &p);
+	colorspace = qoi_stream_get_32(b, &p);
+	px_pos = qoi_stream_get_32(b, &p);
+	px_len = qoi_stream_get_32(b, &p);
+	px_end = qoi_stream_get_32(b, &p);
+	run = qoi_stream_get_32(b, &p);
+	px_have = qoi_stream_get_32(b, &p);
+	for (i = 0; i < 4; i++) {
+		px_cur[i] = b[p++];
+	}
+	px_prev.v = qoi_stream_get_32(b, &p);
+	for (i = 0; i < 64; i++) {
+		index[i].v = qoi_stream_get_32(b, &p);
+	}
+	hash = qoi_stream_get_32(b, &p);
+
+	if (hash != qoi_stream_state_hash(b, QOI_STREAM_STATE_SIZE - 4)) {
+		return QOI_STREAM_BAD_ARG;
+	}
+	/* The state must belong to exactly the image the encoder was set up
+	for, and must describe a reachable position inside it. */
+	if (
+		width != enc->width || height != enc->height ||
+		channels != enc->channels || colorspace != enc->colorspace ||
+		px_len != (unsigned int)enc->px_len ||
+		px_end != (unsigned int)enc->px_end ||
+		px_have >= channels ||
+		px_pos % channels != 0 ||
+		px_pos + px_have > px_len ||
+		run > 61
+	) {
+		return QOI_STREAM_BAD_ARG;
+	}
+
+	/* Discard the header staged by qoi_stream_init(): it is already in the
+	durable output that this state is meant to continue. */
+	enc->buf_len = 0;
+	enc->px_pos = (int)px_pos;
+	enc->px_have = (int)px_have;
+	enc->run = (int)run;
+	memcpy(enc->px_cur, px_cur, sizeof(px_cur));
+	enc->px_prev = px_prev;
+	memcpy(enc->index, index, sizeof(index));
+	enc->err = 0;
+	return 0;
+}
+
 
 #ifndef QOI_NO_STDIO
 #include <stdio.h>
